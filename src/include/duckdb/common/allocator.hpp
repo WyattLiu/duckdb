@@ -9,6 +9,8 @@
 #pragma once
 
 #include "duckdb/common/common.hpp"
+#include <iostream>
+#include <mutex>
 
 namespace duckdb {
 class Allocator;
@@ -47,6 +49,7 @@ private:
 };
 
 class Allocator {
+
 public:
 	Allocator();
 	Allocator(allocate_function_ptr_t allocate_function_p, free_function_ptr_t free_function_p,
