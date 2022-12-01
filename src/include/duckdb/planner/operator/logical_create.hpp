@@ -23,6 +23,11 @@ public:
 	SchemaCatalogEntry *schema;
 	unique_ptr<CreateInfo> info;
 
+public:
+	void Serialize(FieldWriter &writer) const override;
+	static unique_ptr<LogicalOperator> Deserialize(LogicalDeserializationState &state, FieldReader &reader);
+	idx_t EstimateCardinality(ClientContext &context) override;
+
 protected:
 	void ResolveTypes() override {
 		types.emplace_back(LogicalType::BIGINT);

@@ -52,6 +52,9 @@ public:
 	bool GetTaskFromProducer(ProducerToken &token, unique_ptr<Task> &task);
 	//! Run tasks forever until "marker" is set to false, "marker" must remain valid until the thread is joined
 	void ExecuteForever(atomic<bool> *marker);
+	//! Run tasks until `marker` is set to false, `max_tasks` have been completed, or until there are no more tasks
+	//! available. Returns the number of tasks that were completed.
+	idx_t ExecuteTasks(atomic<bool> *marker, idx_t max_tasks);
 	//! Run tasks until `max_tasks` have been completed, or until there are no more tasks available
 	void ExecuteTasks(idx_t max_tasks);
 
@@ -61,6 +64,9 @@ public:
 	//! Returns the number of threads
 	int32_t NumberOfThreads();
 
+	//! Send signals to n threads, signalling for them to wake up and attempt to execute a task
+	void Signal(idx_t n);
+
 private:
 	void SetThreadsInternal(int32_t n);
 
@@ -68,6 +74,8 @@ private:
 	DatabaseInstance &db;
 	//! The task queue
 	unique_ptr<ConcurrentQueue> queue;
+	//! Lock for modifying the thread count
+	mutex thread_lock;
 	//! The active background threads of the task scheduler
 	vector<unique_ptr<SchedulerThread>> threads;
 	//! Markers used by the various threads, if the markers are set to "false" the thread execution is stopped

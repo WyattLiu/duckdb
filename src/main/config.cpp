@@ -1,6 +1,7 @@
 #include "duckdb/main/config.hpp"
-#include "duckdb/common/string_util.hpp"
+
 #include "duckdb/common/operator/cast_operators.hpp"
+#include "duckdb/common/string_util.hpp"
 #include "duckdb/main/settings.hpp"
 
 namespace duckdb {
@@ -26,25 +27,33 @@ static ConfigurationOption internal_options[] = {DUCKDB_GLOBAL(AccessModeSetting
                                                  DUCKDB_GLOBAL(CheckpointThresholdSetting),
                                                  DUCKDB_GLOBAL(DebugCheckpointAbort),
                                                  DUCKDB_LOCAL(DebugForceExternal),
-                                                 DUCKDB_GLOBAL(DebugManyFreeListBlocks),
+                                                 DUCKDB_LOCAL(DebugForceNoCrossProduct),
                                                  DUCKDB_GLOBAL(DebugWindowMode),
                                                  DUCKDB_GLOBAL_LOCAL(DefaultCollationSetting),
                                                  DUCKDB_GLOBAL(DefaultOrderSetting),
                                                  DUCKDB_GLOBAL(DefaultNullOrderSetting),
                                                  DUCKDB_GLOBAL(DisabledOptimizersSetting),
                                                  DUCKDB_GLOBAL(EnableExternalAccessSetting),
+                                                 DUCKDB_GLOBAL(EnableFSSTVectors),
+                                                 DUCKDB_GLOBAL(AllowUnsignedExtensionsSetting),
                                                  DUCKDB_GLOBAL(EnableObjectCacheSetting),
                                                  DUCKDB_LOCAL(EnableProfilingSetting),
                                                  DUCKDB_LOCAL(EnableProgressBarSetting),
+                                                 DUCKDB_GLOBAL(ExperimentalParallelCSVSetting),
                                                  DUCKDB_LOCAL(ExplainOutputSetting),
                                                  DUCKDB_GLOBAL(ExternalThreadsSetting),
+                                                 DUCKDB_LOCAL(FileSearchPathSetting),
                                                  DUCKDB_GLOBAL(ForceCompressionSetting),
+                                                 DUCKDB_LOCAL(HomeDirectorySetting),
                                                  DUCKDB_LOCAL(LogQueryPathSetting),
+                                                 DUCKDB_LOCAL(MaximumExpressionDepthSetting),
                                                  DUCKDB_GLOBAL(MaximumMemorySetting),
                                                  DUCKDB_GLOBAL_ALIAS("memory_limit", MaximumMemorySetting),
                                                  DUCKDB_GLOBAL_ALIAS("null_order", DefaultNullOrderSetting),
+                                                 DUCKDB_GLOBAL(PasswordSetting),
                                                  DUCKDB_LOCAL(PerfectHashThresholdSetting),
                                                  DUCKDB_LOCAL(PreserveIdentifierCase),
+                                                 DUCKDB_GLOBAL(PreserveInsertionOrder),
                                                  DUCKDB_LOCAL(ProfilerHistorySize),
                                                  DUCKDB_LOCAL(ProfileOutputSetting),
                                                  DUCKDB_LOCAL(ProfilingModeSetting),
@@ -54,6 +63,8 @@ static ConfigurationOption internal_options[] = {DUCKDB_GLOBAL(AccessModeSetting
                                                  DUCKDB_LOCAL(SearchPathSetting),
                                                  DUCKDB_GLOBAL(TempDirectorySetting),
                                                  DUCKDB_GLOBAL(ThreadsSetting),
+                                                 DUCKDB_GLOBAL(UsernameSetting),
+                                                 DUCKDB_GLOBAL_ALIAS("user", UsernameSetting),
                                                  DUCKDB_GLOBAL_ALIAS("wal_autocheckpoint", CheckpointThresholdSetting),
                                                  DUCKDB_GLOBAL_ALIAS("worker_threads", ThreadsSetting),
                                                  FINAL_SETTING};
@@ -72,6 +83,14 @@ idx_t DBConfig::GetOptionCount() {
 		count++;
 	}
 	return count;
+}
+
+vector<std::string> DBConfig::GetOptionNames() {
+	vector<string> names;
+	for (idx_t i = 0, option_count = DBConfig::GetOptionCount(); i < option_count; i++) {
+		names.emplace_back(DBConfig::GetOptionByIndex(i)->name);
+	}
+	return names;
 }
 
 ConfigurationOption *DBConfig::GetOptionByIndex(idx_t target_index) {
@@ -95,16 +114,30 @@ ConfigurationOption *DBConfig::GetOptionByName(const string &name) {
 }
 
 void DBConfig::SetOption(const ConfigurationOption &option, const Value &value) {
+	SetOption(nullptr, option, value);
+}
+
+void DBConfig::SetOption(DatabaseInstance *db, const ConfigurationOption &option, const Value &value) {
+	lock_guard<mutex> l(config_lock);
 	if (!option.set_global) {
 		throw InternalException("Could not set option \"%s\" as a global option", option.name);
 	}
-	Value input = value.CastAs(option.parameter_type);
-	option.set_global(nullptr, *this, input);
+	Value input = value.DefaultCastAs(option.parameter_type);
+	option.set_global(db, *this, input);
+}
+
+void DBConfig::SetOption(const string &name, Value value) {
+	lock_guard<mutex> l(config_lock);
+	options.set_variables[name] = move(value);
 }
 
 void DBConfig::AddExtensionOption(string name, string description, LogicalType parameter,
                                   set_option_callback_t function) {
 	extension_parameters.insert(make_pair(move(name), ExtensionOption(move(description), move(parameter), function)));
+}
+
+CastFunctionSet &DBConfig::GetCastFunctions() {
+	return *cast_functions;
 }
 
 idx_t DBConfig::ParseMemoryLimit(const string &arg) {
@@ -157,6 +190,19 @@ idx_t DBConfig::ParseMemoryLimit(const string &arg) {
 		throw ParserException("Unknown unit for memory_limit: %s (expected: b, mb, gb or tb)", unit);
 	}
 	return (idx_t)multiplier * limit;
+}
+
+// Right now we only really care about access mode when comparing DBConfigs
+bool DBConfigOptions::operator==(const DBConfigOptions &other) const {
+	return other.access_mode == access_mode;
+}
+
+bool DBConfig::operator==(const DBConfig &other) {
+	return other.options == options;
+}
+
+bool DBConfig::operator!=(const DBConfig &other) {
+	return !(other.options == options);
 }
 
 } // namespace duckdb

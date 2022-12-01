@@ -21,11 +21,17 @@ BindResult ColumnAliasBinder::BindAlias(ExpressionBinder &enclosing_binder, Colu
 		return BindResult(StringUtil::Format("Alias %s is not found.", expr.ToString()));
 	}
 
+	if (in_alias) {
+		return BindResult("Cannot resolve self-referential alias");
+	}
+
 	// found an alias: bind the alias expression
-	D_ASSERT(!in_alias);
 	auto expression = node.original_expressions[alias_entry->second]->Copy();
 	in_alias = true;
-	auto result = enclosing_binder.BindExpression(&expression, depth, root_expression);
+
+	// since the alias has been found, pass a depth of 0. See Issue 4978 (#16)
+	// ColumnAliasBinders are only in Having, Qualify and Where Binders
+	auto result = enclosing_binder.BindExpression(&expression, 0, root_expression);
 	in_alias = false;
 	return result;
 }

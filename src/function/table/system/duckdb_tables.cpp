@@ -12,7 +12,7 @@
 
 namespace duckdb {
 
-struct DuckDBTablesData : public FunctionOperatorData {
+struct DuckDBTablesData : public GlobalTableFunctionState {
 	DuckDBTablesData() : offset(0) {
 	}
 
@@ -61,8 +61,7 @@ static unique_ptr<FunctionData> DuckDBTablesBind(ClientContext &context, TableFu
 	return nullptr;
 }
 
-unique_ptr<FunctionOperatorData> DuckDBTablesInit(ClientContext &context, const FunctionData *bind_data,
-                                                  const vector<column_t> &column_ids, TableFilterCollection *filters) {
+unique_ptr<GlobalTableFunctionState> DuckDBTablesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_unique<DuckDBTablesData>();
 
 	// scan all the schemas for tables and collect themand collect them
@@ -72,8 +71,8 @@ unique_ptr<FunctionOperatorData> DuckDBTablesInit(ClientContext &context, const 
 	};
 
 	// check the temp schema as well
-	ClientData::Get(context).temporary_objects->Scan(context, CatalogType::TABLE_ENTRY,
-	                                                 [&](CatalogEntry *entry) { result->entries.push_back(entry); });
+	SchemaCatalogEntry::GetTemporaryObjects(context)->Scan(
+	    context, CatalogType::TABLE_ENTRY, [&](CatalogEntry *entry) { result->entries.push_back(entry); });
 	return move(result);
 }
 
@@ -99,9 +98,8 @@ static idx_t CheckConstraintCount(TableCatalogEntry &table) {
 	return check_count;
 }
 
-void DuckDBTablesFunction(ClientContext &context, const FunctionData *bind_data, FunctionOperatorData *operator_state,
-                          DataChunk &output) {
-	auto &data = (DuckDBTablesData &)*operator_state;
+void DuckDBTablesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = (DuckDBTablesData &)*data_p.global_state;
 	if (data.offset >= data.entries.size()) {
 		// finished returning values
 		return;
@@ -134,7 +132,7 @@ void DuckDBTablesFunction(ClientContext &context, const FunctionData *bind_data,
 		// estimated_size, LogicalType::BIGINT
 		output.SetValue(7, count, Value::BIGINT(table.storage->info->cardinality.load()));
 		// column_count, LogicalType::BIGINT
-		output.SetValue(8, count, Value::BIGINT(table.columns.size()));
+		output.SetValue(8, count, Value::BIGINT(table.columns.LogicalColumnCount()));
 		// index_count, LogicalType::BIGINT
 		output.SetValue(9, count, Value::BIGINT(table.storage->info->indexes.Count()));
 		// check_constraint_count, LogicalType::BIGINT

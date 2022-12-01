@@ -1,14 +1,21 @@
+#ifdef USE_DUCKDB_SHELL_WRAPPER
+#include "duckdb_shell_wrapper.h"
+#endif
 #include "sqlite3.h"
+#include "sql_auto_complete_extension.hpp"
 #include "udf_struct_sqlite3.h"
 #include "sqlite3_udf_wrapper.hpp"
+#include "cast_sqlite.hpp"
 
 #include "duckdb.hpp"
 #include "duckdb/parser/parser.hpp"
 #include "duckdb/main/client_context.hpp"
 #include "duckdb/common/types.hpp"
 #include "duckdb/common/operator/cast_operators.hpp"
-
+#include "duckdb/common/preserved_error.hpp"
+#include "duckdb/main/error_manager.hpp"
 #include "utf8proc_wrapper.hpp"
+#include "duckdb/common/box_renderer.hpp"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -19,9 +26,14 @@
 #include <chrono>
 #include <cassert>
 #include <climits>
+#include <thread>
 
 using namespace duckdb;
 using namespace std;
+
+extern "C" {
+char *sqlite3_print_duckbox(sqlite3_stmt *pStmt, size_t max_rows, char *null_value);
+}
 
 static char *sqlite3_strdup(const char *str);
 
@@ -89,15 +101,30 @@ int sqlite3_open_v2(const char *filename, /* Database filename (UTF-8) */
 	try {
 		pDb = new sqlite3();
 		DBConfig config;
-		config.access_mode = AccessMode::AUTOMATIC;
+		config.options.access_mode = AccessMode::AUTOMATIC;
 		if (flags & SQLITE_OPEN_READONLY) {
-			config.access_mode = AccessMode::READ_ONLY;
+			config.options.access_mode = AccessMode::READ_ONLY;
 		}
+		if (flags & DUCKDB_UNSIGNED_EXTENSIONS) {
+			config.options.allow_unsigned_extensions = true;
+		}
+		config.error_manager->AddCustomError(
+		    ErrorType::UNSIGNED_EXTENSION,
+		    "Extension \"%s\" could not be loaded because its signature is either missing or invalid and unsigned "
+		    "extensions are disabled by configuration.\nStart the shell with the -unsigned parameter to allow this "
+		    "(e.g. duckdb -unsigned).");
 		pDb->db = make_unique<DuckDB>(filename, &config);
+		pDb->db->LoadExtension<SQLAutoCompleteExtension>();
 		pDb->con = make_unique<Connection>(*pDb->db);
+	} catch (const Exception &ex) {
+		if (pDb) {
+			pDb->last_error = PreservedError(ex);
+			pDb->errCode = SQLITE_ERROR;
+		}
+		rc = SQLITE_ERROR;
 	} catch (std::exception &ex) {
 		if (pDb) {
-			pDb->last_error = ex.what();
+			pDb->last_error = PreservedError(ex);
 			pDb->errCode = SQLITE_ERROR;
 		}
 		rc = SQLITE_ERROR;
@@ -154,15 +181,15 @@ int sqlite3_prepare_v2(sqlite3 *db,           /* Database handle */
 		// we directly execute all statements besides the final one
 		for (idx_t i = 0; i + 1 < statements.size(); i++) {
 			auto res = db->con->Query(move(statements[i]));
-			if (!res->success) {
-				db->last_error = res->error;
+			if (res->HasError()) {
+				db->last_error = res->GetErrorObject();
 				return SQLITE_ERROR;
 			}
 		}
 
 		// now prepare the query
 		auto prepared = db->con->Prepare(move(statements.back()));
-		if (!prepared->success) {
+		if (prepared->HasError()) {
 			// failed to prepare: set the error message
 			db->last_error = prepared->error;
 			return SQLITE_ERROR;
@@ -186,24 +213,59 @@ int sqlite3_prepare_v2(sqlite3 *db,           /* Database handle */
 
 		*ppStmt = stmt.release();
 		return SQLITE_OK;
+	} catch (const Exception &ex) {
+		db->last_error = PreservedError(ex);
+		return SQLITE_ERROR;
 	} catch (std::exception &ex) {
-		db->last_error = ex.what();
+		db->last_error = PreservedError(ex);
 		return SQLITE_ERROR;
 	}
 }
 
-bool sqlite3_display_result(StatementType type) {
-	switch (type) {
-	case StatementType::EXECUTE_STATEMENT:
-	case StatementType::EXPLAIN_STATEMENT:
-	case StatementType::PRAGMA_STATEMENT:
-	case StatementType::SELECT_STATEMENT:
-	case StatementType::SHOW_STATEMENT:
-	case StatementType::CALL_STATEMENT:
-		return true;
-	default:
-		return false;
+char *sqlite3_print_duckbox(sqlite3_stmt *pStmt, size_t max_rows, char *null_value) {
+	if (!pStmt) {
+		return nullptr;
 	}
+	if (!pStmt->prepared) {
+		pStmt->db->last_error = PreservedError("Attempting sqlite3_step() on a non-successfully prepared statement");
+		return nullptr;
+	}
+	if (pStmt->result) {
+		pStmt->db->last_error = PreservedError("Statement has already been executed");
+		return nullptr;
+	}
+	pStmt->result = pStmt->prepared->Execute(pStmt->bound_values, false);
+	if (pStmt->result->HasError()) {
+		// error in execute: clear prepared statement
+		pStmt->db->last_error = pStmt->result->GetErrorObject();
+		pStmt->prepared = nullptr;
+		return nullptr;
+	}
+	auto &materialized = (MaterializedQueryResult &)*pStmt->result;
+	auto properties = pStmt->prepared->GetStatementProperties();
+	if (properties.return_type == StatementReturnType::CHANGED_ROWS && materialized.RowCount() > 0) {
+		// update total changes
+		auto row_changes = materialized.Collection().GetRows().GetValue(0, 0);
+		if (!row_changes.IsNull() && row_changes.DefaultTryCastAs(LogicalType::BIGINT)) {
+			pStmt->db->last_changes = row_changes.GetValue<int64_t>();
+			pStmt->db->total_changes += row_changes.GetValue<int64_t>();
+		}
+	}
+	if (properties.return_type != StatementReturnType::QUERY_RESULT) {
+		// only SELECT statements return results
+		return nullptr;
+	}
+	BoxRendererConfig config;
+	if (max_rows != 0) {
+		config.max_rows = max_rows;
+	}
+	if (null_value) {
+		config.null_value = null_value;
+	}
+	BoxRenderer renderer(config);
+	auto result_rendering =
+	    renderer.ToString(*pStmt->db->con->context, pStmt->result->names, materialized.Collection());
+	return sqlite3_strdup(result_rendering.c_str());
 }
 
 /* Prepare the next result to be retrieved */
@@ -212,16 +274,16 @@ int sqlite3_step(sqlite3_stmt *pStmt) {
 		return SQLITE_MISUSE;
 	}
 	if (!pStmt->prepared) {
-		pStmt->db->last_error = "Attempting sqlite3_step() on a non-successfully prepared statement";
+		pStmt->db->last_error = PreservedError("Attempting sqlite3_step() on a non-successfully prepared statement");
 		return SQLITE_ERROR;
 	}
 	pStmt->current_text = nullptr;
 	if (!pStmt->result) {
 		// no result yet! call Execute()
 		pStmt->result = pStmt->prepared->Execute(pStmt->bound_values, true);
-		if (!pStmt->result->success) {
+		if (pStmt->result->HasError()) {
 			// error in execute: clear prepared statement
-			pStmt->db->last_error = pStmt->result->error;
+			pStmt->db->last_error = pStmt->result->GetErrorObject();
 			pStmt->prepared = nullptr;
 			return SQLITE_ERROR;
 		}
@@ -233,16 +295,17 @@ int sqlite3_step(sqlite3_stmt *pStmt) {
 
 		pStmt->current_row = -1;
 
-		auto statement_type = pStmt->prepared->GetStatementType();
-		if (StatementTypeReturnChanges(statement_type) && pStmt->current_chunk && pStmt->current_chunk->size() > 0) {
+		auto properties = pStmt->prepared->GetStatementProperties();
+		if (properties.return_type == StatementReturnType::CHANGED_ROWS && pStmt->current_chunk &&
+		    pStmt->current_chunk->size() > 0) {
 			// update total changes
 			auto row_changes = pStmt->current_chunk->GetValue(0, 0);
-			if (!row_changes.IsNull() && row_changes.TryCastAs(LogicalType::BIGINT)) {
+			if (!row_changes.IsNull() && row_changes.DefaultTryCastAs(LogicalType::BIGINT)) {
 				pStmt->db->last_changes = row_changes.GetValue<int64_t>();
 				pStmt->db->total_changes += row_changes.GetValue<int64_t>();
 			}
 		}
-		if (!sqlite3_display_result(statement_type)) {
+		if (properties.return_type != StatementReturnType::QUERY_RESULT) {
 			// only SELECT statements return results
 			sqlite3_reset(pStmt);
 		}
@@ -445,7 +508,8 @@ static bool sqlite3_column_has_value(sqlite3_stmt *pStmt, int iCol, LogicalType 
 		return false;
 	}
 	try {
-		val = pStmt->current_chunk->data[iCol].GetValue(pStmt->current_row).CastAs(target_type);
+		val =
+		    pStmt->current_chunk->data[iCol].GetValue(pStmt->current_row).CastAs(*pStmt->db->con->context, target_type);
 	} catch (...) {
 		return false;
 	}
@@ -650,8 +714,8 @@ int sqlite3_initialize(void) {
 
 int sqlite3_finalize(sqlite3_stmt *pStmt) {
 	if (pStmt) {
-		if (pStmt->result && !pStmt->result->success) {
-			pStmt->db->last_error = string(pStmt->result->error);
+		if (pStmt->result && pStmt->result->HasError()) {
+			pStmt->db->last_error = pStmt->result->GetErrorObject();
 			delete pStmt;
 			return SQLITE_ERROR;
 		}
@@ -773,11 +837,11 @@ const char *sqlite3_errmsg(sqlite3 *db) {
 	if (!db) {
 		return "";
 	}
-	return db->last_error.c_str();
+	return db->last_error.Message().c_str();
 }
 
 void sqlite3_interrupt(sqlite3 *db) {
-	if (db) {
+	if (db && db->con) {
 		db->con->Interrupt();
 	}
 }
@@ -979,12 +1043,6 @@ int sqlite3_complete(const char *zSql) {
 	return state == 1;
 }
 
-// checks if input ends with ;
-int sqlite3_complete_old(const char *sql) {
-	fprintf(stderr, "sqlite3_complete: unsupported. '%s'\n", sql);
-	return -1;
-}
-
 // length of varchar or blob value
 int sqlite3_column_bytes(sqlite3_stmt *pStmt, int iCol) {
 	// fprintf(stderr, "sqlite3_column_bytes: unsupported.\n");
@@ -1078,12 +1136,7 @@ const char *sqlite3_column_decltype(sqlite3_stmt *pStmt, int iCol) {
 	return NULL;
 }
 
-int sqlite3_status64(int op, sqlite3_int64 *pCurrent, sqlite3_int64 *pHighwater, int resetFlag) {
-	fprintf(stderr, "sqlite3_status64: unsupported.\n");
-	return -1;
-}
-
-int sqlite3_status64(sqlite3 *, int op, int *pCur, int *pHiwtr, int resetFlg) {
+SQLITE_API int sqlite3_status64(int op, sqlite3_int64 *pCurrent, sqlite3_int64 *pHighwater, int resetFlag) {
 	fprintf(stderr, "sqlite3_status64: unsupported.\n");
 	return -1;
 }
@@ -1093,8 +1146,17 @@ int sqlite3_stmt_status(sqlite3_stmt *, int op, int resetFlg) {
 	return -1;
 }
 
-int sqlite3_file_control(sqlite3 *, const char *zDbName, int op, void *) {
-	fprintf(stderr, "sqlite3_file_control: unsupported.\n");
+int sqlite3_file_control(sqlite3 *, const char *zDbName, int op, void *ptr) {
+	switch (op) {
+	case SQLITE_FCNTL_TEMPFILENAME: {
+		auto char_arg = (char **)ptr;
+		*char_arg = nullptr;
+		return -1;
+	}
+	default:
+		break;
+	}
+	fprintf(stderr, "sqlite3_file_control op %d: unsupported.\n", op);
 	return -1;
 }
 
@@ -1108,9 +1170,9 @@ const char *sqlite3_vtab_collation(sqlite3_index_info *, int) {
 	return nullptr;
 }
 
-int sqlite3_sleep(int) {
-	fprintf(stderr, "sqlite3_sleep: unsupported.\n");
-	return -1;
+int sqlite3_sleep(int ms) {
+	std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+	return ms;
 }
 
 int sqlite3_busy_timeout(sqlite3 *, int ms) {
@@ -1407,18 +1469,21 @@ SQLITE_API char *sqlite3_win32_unicode_to_utf8(LPCWSTR zWideText) {
 #endif
 
 // TODO complain
-SQLITE_API void sqlite3_result_blob(sqlite3_context *context, const void *blob, int n_bytes, void (*)(void *)) {
+SQLITE_API void sqlite3_result_blob(sqlite3_context *context, const void *blob, int n_bytes, void (*xDel)(void *)) {
+	sqlite3_result_blob64(context, blob, n_bytes, xDel);
+}
+
+SQLITE_API void sqlite3_result_blob64(sqlite3_context *context, const void *blob, sqlite3_uint64 n_bytes,
+                                      void (*xDel)(void *)) {
 	if (!blob) {
 		context->isError = SQLITE_MISUSE;
 		return;
 	}
 	context->result.type = SQLiteTypeValue::BLOB;
-	context->result.n = n_bytes;
-	string_t str = string_t((const char *)blob, n_bytes);
-	context->result.str_t = str;
-}
-
-SQLITE_API void sqlite3_result_blob64(sqlite3_context *, const void *, sqlite3_uint64, void (*)(void *)) {
+	context->result.str = string((char *)blob, n_bytes);
+	if (xDel) {
+		xDel((void *)blob);
+	}
 }
 
 SQLITE_API void sqlite3_result_double(sqlite3_context *context, double val) {
@@ -1431,16 +1496,104 @@ SQLITE_API void sqlite3_result_error(sqlite3_context *context, const char *msg, 
 	sqlite3_result_text(context, msg, n_bytes, nullptr);
 }
 
-SQLITE_API void sqlite3_result_error16(sqlite3_context *, const void *, int) {
+SQLITE_API void sqlite3_result_error16(sqlite3_context *context, const void *msg, int n_bytes) {
+	fprintf(stderr, "sqlite3_result_error16: unsupported.\n");
 }
 
-SQLITE_API void sqlite3_result_error_toobig(sqlite3_context *) {
+SQLITE_API void sqlite3_result_error_toobig(sqlite3_context *context) {
+	sqlite3_result_error(context, "string or blob too big", -1);
 }
 
-SQLITE_API void sqlite3_result_error_nomem(sqlite3_context *) {
+SQLITE_API void sqlite3_result_error_nomem(sqlite3_context *context) {
+	sqlite3_result_error(context, "out of memory", -1);
 }
 
-SQLITE_API void sqlite3_result_error_code(sqlite3_context *, int) {
+SQLITE_API void sqlite3_result_error_code(sqlite3_context *context, int code) {
+	string error_msg;
+	switch (code) {
+	case SQLITE_NOMEM:
+		sqlite3_result_error_nomem(context);
+		return;
+	case SQLITE_TOOBIG:
+		sqlite3_result_error_toobig(context);
+		return;
+	case SQLITE_ERROR:
+		error_msg = "Generic error";
+		break;
+	case SQLITE_INTERNAL:
+		error_msg = "Internal logic error in SQLite";
+		break;
+	case SQLITE_PERM:
+		error_msg = "Access permission denied";
+		break;
+	case SQLITE_ABORT:
+		error_msg = "Callback routine requested an abort";
+		break;
+	case SQLITE_BUSY:
+		error_msg = "The database file is locked";
+		break;
+	case SQLITE_LOCKED:
+		error_msg = "A table in the database is locked";
+		break;
+	case SQLITE_READONLY:
+		error_msg = "Attempt to write a readonly database";
+		break;
+	case SQLITE_INTERRUPT:
+		error_msg = "Operation terminated by sqlite3_interrupt(";
+		break;
+	case SQLITE_IOERR:
+		error_msg = "Some kind of disk I/O error occurred";
+		break;
+	case SQLITE_CORRUPT:
+		error_msg = "The database disk image is malformed";
+		break;
+	case SQLITE_NOTFOUND:
+		error_msg = "Unknown opcode in sqlite3_file_control()";
+		break;
+	case SQLITE_FULL:
+		error_msg = "Insertion failed because database is full";
+		break;
+	case SQLITE_CANTOPEN:
+		error_msg = "Unable to open the database file";
+		break;
+	case SQLITE_PROTOCOL:
+		error_msg = "Database lock protocol error";
+		break;
+	case SQLITE_EMPTY:
+		error_msg = "Internal use only";
+		break;
+	case SQLITE_SCHEMA:
+		error_msg = "The database schema changed";
+		break;
+	case SQLITE_CONSTRAINT:
+		error_msg = "Abort due to constraint violation";
+		break;
+	case SQLITE_MISMATCH:
+		error_msg = "Data type mismatch";
+		break;
+	case SQLITE_MISUSE:
+		error_msg = "Library used incorrectly";
+		break;
+	case SQLITE_NOLFS:
+		error_msg = "Uses OS features not supported on host";
+		break;
+	case SQLITE_AUTH:
+		error_msg = "Authorization denied";
+		break;
+	case SQLITE_FORMAT:
+		error_msg = "Not used";
+		break;
+	case SQLITE_RANGE:
+		error_msg = "2nd parameter to sqlite3_bind out of range";
+		break;
+	case SQLITE_NOTADB:
+		error_msg = "File opened that is not a database file";
+		break;
+	default:
+		error_msg = "unknown error code";
+		break;
+	}
+	sqlite3_result_error(context, error_msg.c_str(), error_msg.size());
 }
 
 SQLITE_API void sqlite3_result_int(sqlite3_context *context, int val) {
@@ -1456,10 +1609,13 @@ SQLITE_API void sqlite3_result_null(sqlite3_context *context) {
 	context->result.type = SQLiteTypeValue::NULL_VALUE;
 }
 
-SQLITE_API void sqlite3_result_text(sqlite3_context *context, const char *str_c, int n_chars, void (*)(void *)) {
+SQLITE_API void sqlite3_result_text(sqlite3_context *context, const char *str_c, int n_chars, void (*xDel)(void *)) {
 	if (!str_c) {
 		context->isError = SQLITE_MISUSE;
 		return;
+	}
+	if (n_chars < 0) {
+		n_chars = strlen(str_c);
 	}
 
 	auto utf_type = Utf8Proc::Analyze(str_c, n_chars);
@@ -1467,9 +1623,10 @@ SQLITE_API void sqlite3_result_text(sqlite3_context *context, const char *str_c,
 		context->isError = SQLITE_MISUSE;
 		return;
 	}
-	context->result.type = SQLiteTypeValue::TEXT;
-	context->result.n = n_chars;
-	context->result.str_t = string_t(str_c, n_chars);
+	context->result = CastToSQLiteValue::Operation<string_t>(string_t(str_c, n_chars));
+	if (xDel && xDel != SQLITE_TRANSIENT) {
+		xDel((void *)str_c);
+	}
 }
 
 SQLITE_API void sqlite3_result_text64(sqlite3_context *, const char *, sqlite3_uint64, void (*)(void *),
@@ -1498,7 +1655,6 @@ SQLITE_API int sqlite3_result_zeroblob64(sqlite3_context *, sqlite3_uint64 n) {
 	return -1;
 }
 
-// TODO complain
 const void *sqlite3_value_blob(sqlite3_value *pVal) {
 	return sqlite3_value_text(pVal);
 }
@@ -1516,7 +1672,7 @@ double sqlite3_value_double(sqlite3_value *pVal) {
 	case SQLiteTypeValue::TEXT:
 	case SQLiteTypeValue::BLOB:
 		double res;
-		if (TryCast::Operation<string_t, double>(pVal->str_t, res)) {
+		if (TryCast::Operation<string_t, double>(string_t(pVal->str), res)) {
 			return res;
 		}
 		break;
@@ -1552,7 +1708,7 @@ sqlite3_int64 sqlite3_value_int64(sqlite3_value *pVal) {
 		break;
 	case SQLiteTypeValue::TEXT:
 	case SQLiteTypeValue::BLOB:
-		if (TryCast::Operation<string_t, int64_t>(pVal->str_t, res)) {
+		if (TryCast::Operation<string_t, int64_t>(string_t(pVal->str), res)) {
 			return res;
 		}
 		break;
@@ -1572,45 +1728,19 @@ const unsigned char *sqlite3_value_text(sqlite3_value *pVal) {
 		pVal->db->errCode = SQLITE_MISUSE;
 		return nullptr;
 	}
-	// check if the string has already been allocated
-	if (pVal->szMalloc > 0) {
-		return (const unsigned char *)pVal->zMalloc;
-	}
-
 	if (pVal->type == SQLiteTypeValue::TEXT || pVal->type == SQLiteTypeValue::BLOB) {
-		auto length = pVal->str_t.GetSize();
-		// new string including space for the null-terminated char ('\0')
-		pVal->zMalloc = (char *)malloc(sizeof(char) * length + 1);
-		if (!pVal->zMalloc) {
-			pVal->db->errCode = SQLITE_NOMEM;
-			return nullptr;
-		}
-		pVal->szMalloc = length + 1;
-		memcpy(pVal->zMalloc, pVal->str_t.GetDataUnsafe(), length);
-		pVal->zMalloc[length] = '\0';
-		return (const unsigned char *)pVal->zMalloc;
+		return (const unsigned char *)pVal->str.c_str();
 	}
 
 	if (pVal->type == SQLiteTypeValue::INTEGER || pVal->type == SQLiteTypeValue::FLOAT) {
 		Value value = (pVal->type == SQLiteTypeValue::INTEGER) ? Value::BIGINT(pVal->u.i) : Value::DOUBLE(pVal->u.r);
-		if (!value.TryCastAs(LogicalType::VARCHAR)) {
+		if (!value.DefaultTryCastAs(LogicalType::VARCHAR)) {
 			pVal->db->errCode = SQLITE_NOMEM;
 			return nullptr;
 		}
 		auto &str_val = StringValue::Get(value);
-		size_t str_len = str_val.size();
-		pVal->zMalloc = (char *)malloc(sizeof(char) * (str_len + 1));
-		if (!pVal->zMalloc) {
-			pVal->db->errCode = SQLITE_NOMEM;
-			return nullptr;
-		}
-		pVal->szMalloc = str_len + 1; // +1 null-terminated char
-		memcpy(pVal->zMalloc, str_val.c_str(), pVal->szMalloc);
-
-		pVal->str_t = string_t(pVal->zMalloc, pVal->szMalloc - 1); // -1 null-terminated char
-		pVal->n = pVal->str_t.GetSize();
-		pVal->type = SQLiteTypeValue::TEXT;
-		return (const unsigned char *)pVal->zMalloc;
+		*pVal = CastToSQLiteValue::Operation<string_t>(string_t(str_val));
+		return (const unsigned char *)pVal->str.c_str();
 	}
 	if (pVal->type == SQLiteTypeValue::NULL_VALUE) {
 		return nullptr;
@@ -1633,7 +1763,7 @@ SQLITE_API const void *sqlite3_value_text16be(sqlite3_value *) {
 
 SQLITE_API int sqlite3_value_bytes(sqlite3_value *pVal) {
 	if (pVal->type == SQLiteTypeValue::TEXT || pVal->type == SQLiteTypeValue::BLOB) {
-		return pVal->n;
+		return pVal->str.size();
 	}
 	return 0;
 }
@@ -1652,6 +1782,17 @@ SQLITE_API int sqlite3_value_numeric_type(sqlite3_value *) {
 
 SQLITE_API int sqlite3_value_nochange(sqlite3_value *) {
 	return 0;
+}
+
+SQLITE_API sqlite3_value *sqlite3_value_dup(const sqlite3_value *val) {
+	return new sqlite3_value(*val);
+}
+
+SQLITE_API void sqlite3_value_free(sqlite3_value *val) {
+	if (!val) {
+		return;
+	}
+	delete val;
 }
 
 SQLITE_API void *sqlite3_aggregate_context(sqlite3_context *, int nBytes) {

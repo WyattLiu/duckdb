@@ -16,17 +16,17 @@
 namespace duckdb {
 
 TableDataReader::TableDataReader(MetaBlockReader &reader, BoundCreateTableInfo &info) : reader(reader), info(info) {
-	info.data = make_unique<PersistentTableData>(info.Base().columns.size());
+	info.data = make_unique<PersistentTableData>(info.Base().columns.LogicalColumnCount());
 }
 
 void TableDataReader::ReadTableData() {
 	auto &columns = info.Base().columns;
-	D_ASSERT(columns.size() > 0);
+	D_ASSERT(!columns.empty());
 
 	// deserialize the total table statistics
-	info.data->column_stats.reserve(columns.size());
-	for (idx_t i = 0; i < columns.size(); i++) {
-		info.data->column_stats.push_back(BaseStatistics::Deserialize(reader, columns[i].type));
+	info.data->column_stats.reserve(columns.PhysicalColumnCount());
+	for (auto &col : columns.Physical()) {
+		info.data->column_stats.push_back(BaseStatistics::Deserialize(reader, col.Type()));
 	}
 
 	// deserialize each of the individual row groups

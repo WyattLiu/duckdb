@@ -28,31 +28,30 @@ BoundStatement Binder::Bind(DeleteStatement &stmt) {
 
 	if (!table->temporary) {
 		// delete from persistent table: not read only!
-		this->read_only = false;
+		properties.read_only = false;
 	}
+
+	// Add CTEs as bindable
+	AddCTEMap(stmt.cte_map);
 
 	// plan any tables from the various using clauses
 	if (!stmt.using_clauses.empty()) {
 		unique_ptr<LogicalOperator> child_operator;
 		for (auto &using_clause : stmt.using_clauses) {
 			// bind the using clause
-			auto bound_node = Bind(*using_clause);
+			auto using_binder = Binder::CreateBinder(context, this);
+			auto bound_node = using_binder->Bind(*using_clause);
 			auto op = CreatePlan(*bound_node);
 			if (child_operator) {
 				// already bound a child: create a cross product to unify the two
-				auto cross_product = make_unique<LogicalCrossProduct>();
-				cross_product->children.push_back(move(child_operator));
-				cross_product->children.push_back(move(op));
-				child_operator = move(cross_product);
+				child_operator = LogicalCrossProduct::Create(move(child_operator), move(op));
 			} else {
 				child_operator = move(op);
 			}
+			bind_context.AddContext(move(using_binder->bind_context));
 		}
 		if (child_operator) {
-			auto cross_product = make_unique<LogicalCrossProduct>();
-			cross_product->children.push_back(move(root));
-			cross_product->children.push_back(move(child_operator));
-			root = move(cross_product);
+			root = LogicalCrossProduct::Create(move(root), move(child_operator));
 		}
 	}
 
@@ -68,7 +67,7 @@ BoundStatement Binder::Bind(DeleteStatement &stmt) {
 		root = move(filter);
 	}
 	// create the delete node
-	auto del = make_unique<LogicalDelete>(table);
+	auto del = make_unique<LogicalDelete>(table, GenerateTableIndex());
 	del->AddChild(move(root));
 
 	// set up the delete expression
@@ -85,12 +84,13 @@ BoundStatement Binder::Bind(DeleteStatement &stmt) {
 		unique_ptr<LogicalOperator> del_as_logicaloperator = move(del);
 		return BindReturning(move(stmt.returning_list), table, update_table_index, move(del_as_logicaloperator),
 		                     move(result));
-	} else {
-		result.plan = move(del);
-		result.names = {"Count"};
-		result.types = {LogicalType::BIGINT};
-		this->allow_stream_result = false;
 	}
+	result.plan = move(del);
+	result.names = {"Count"};
+	result.types = {LogicalType::BIGINT};
+	properties.allow_stream_result = false;
+	properties.return_type = StatementReturnType::CHANGED_ROWS;
+
 	return result;
 }
 

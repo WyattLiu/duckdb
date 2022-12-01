@@ -1,5 +1,8 @@
+#include "duckdb.hpp"
 #include "duckdb_node.hpp"
+#include "napi.h"
 
+#include <iostream>
 #include <thread>
 
 namespace node_duckdb {
@@ -12,8 +15,10 @@ Napi::Object Connection::Init(Napi::Env env, Napi::Object exports) {
 	Napi::Function t =
 	    DefineClass(env, "Connection",
 	                {InstanceMethod("prepare", &Connection::Prepare), InstanceMethod("exec", &Connection::Exec),
-	                 InstanceMethod("register_bulk", &Connection::Register),
-	                 InstanceMethod("unregister", &Connection::Unregister)});
+	                 InstanceMethod("register_udf_bulk", &Connection::RegisterUdf),
+	                 InstanceMethod("register_buffer", &Connection::RegisterBuffer),
+	                 InstanceMethod("unregister_udf", &Connection::UnregisterUdf),
+	                 InstanceMethod("unregister_buffer", &Connection::UnRegisterBuffer)});
 
 	constructor = Napi::Persistent(t);
 	constructor.SuppressDestruct();
@@ -23,13 +28,39 @@ Napi::Object Connection::Init(Napi::Env env, Napi::Object exports) {
 }
 
 struct ConnectTask : public Task {
-	ConnectTask(Connection &connection_, Napi::Function callback_) : Task(connection_, callback_) {
+	ConnectTask(Connection &connection, Napi::Function callback) : Task(connection, callback) {
 	}
 
 	void DoWork() override {
 		auto &connection = Get<Connection>();
+		if (!connection.database_ref || !connection.database_ref->database) {
+			return;
+		}
 		connection.connection = duckdb::make_unique<duckdb::Connection>(*connection.database_ref->database);
+		success = true;
 	}
+	void Callback() override {
+		auto &connection = Get<Connection>();
+		Napi::Env env = connection.Env();
+
+		std::vector<napi_value> args;
+		if (!success) {
+			args.push_back(Utils::CreateError(env, "Invalid database object"));
+		} else {
+			args.push_back(env.Null());
+		}
+
+		Napi::HandleScope scope(env);
+
+		callback.Value().MakeCallback(connection.Value(), args);
+	}
+
+	bool success = false;
+};
+
+struct NodeReplacementScanData : duckdb::ReplacementScanData {
+	NodeReplacementScanData(Connection *con_p) : connection_ref(con_p) {};
+	Connection *connection_ref;
 };
 
 Connection::Connection(const Napi::CallbackInfo &info) : Napi::ObjectWrap<Connection>(info) {
@@ -43,6 +74,11 @@ Connection::Connection(const Napi::CallbackInfo &info) : Napi::ObjectWrap<Connec
 
 	database_ref = Napi::ObjectWrap<Database>::Unwrap(info[0].As<Napi::Object>());
 	database_ref->Ref();
+
+	// Register replacement scan
+	// TODO: disabled currently, either fix or remove.
+	//	database_ref->database->instance->config.replacement_scans.emplace_back(
+	//	    ScanReplacement, duckdb::make_unique<NodeReplacementScanData>(this));
 
 	Napi::Function callback;
 	if (info.Length() > 0 && info[1].IsFunction()) {
@@ -75,94 +111,28 @@ struct JSArgs {
 	duckdb::DataChunk *args;
 	duckdb::Vector *result;
 	bool done;
-	std::string error;
+	duckdb::PreservedError error;
 };
 
-static Napi::Value transform_vector(Napi::Env env, duckdb::Vector &vec, duckdb::idx_t rows, bool copy) {
-	Napi::EscapableHandleScope scope(env);
-
-	Napi::Array data_buffers(Napi::Array::New(env));
-
-	auto data_buffer_index = -1;
-	auto length_buffer_index = -1;
-	auto validity_buffer_index = -1;
-
-	auto validity_buffer = Napi::Buffer<uint8_t>::New(env, rows);
-	auto validity = duckdb::FlatVector::Validity(vec);
-	auto validity_ptr = validity_buffer.Data();
-	for (duckdb::idx_t row_idx = 0; row_idx < rows; row_idx++) {
-		validity_ptr[row_idx] = validity.RowIsValid(row_idx);
-	}
-	data_buffers.Set(data_buffers.Length(), validity_buffer);
-	validity_buffer_index = data_buffers.Length() - 1;
-
-	auto &vec_type = vec.GetType();
-
-	switch (vec_type.id()) {
-	case duckdb::LogicalTypeId::BOOLEAN:
-	case duckdb::LogicalTypeId::UTINYINT:
-	case duckdb::LogicalTypeId::TINYINT:
-	case duckdb::LogicalTypeId::USMALLINT:
-	case duckdb::LogicalTypeId::SMALLINT:
-	case duckdb::LogicalTypeId::INTEGER:
-	case duckdb::LogicalTypeId::UINTEGER:
-	case duckdb::LogicalTypeId::FLOAT:
-	case duckdb::LogicalTypeId::DOUBLE: {
-		auto data_buffer = Napi::Buffer<uint8_t>::New(env, rows * duckdb::GetTypeIdSize(vec_type.InternalType()));
-		// TODO this is technically not neccessary but it fixes a crash in Node 14. Some weird data ownership issue.
-		memcpy(data_buffer.Data(), duckdb::FlatVector::GetData<uint8_t>(vec),
-		       rows * duckdb::GetTypeIdSize(vec_type.InternalType()));
-
-		data_buffers.Set(data_buffers.Length(), data_buffer);
-		data_buffer_index = data_buffers.Length() - 1;
-		break;
-	}
-	case duckdb::LogicalTypeId::VARCHAR: {
-		Napi::Array string_buffers(Napi::Array::New(env, rows));
-		if (copy) {
-			auto string_vec_ptr = duckdb::FlatVector::GetData<duckdb::string_t>(vec);
-			for (duckdb::idx_t row_idx = 0; row_idx < rows; row_idx++) {
-				string_buffers.Set(row_idx, validity_ptr[row_idx]
-				                                ? Napi::String::New(env, string_vec_ptr[row_idx].GetDataUnsafe(),
-				                                                    string_vec_ptr[row_idx].GetSize())
-				                                : Napi::Value());
-			}
-		}
-		data_buffers.Set(data_buffers.Length(), string_buffers);
-		data_buffer_index = data_buffers.Length() - 1;
-		break;
-	}
-	default:
-		throw duckdb::NotImplementedException(vec_type.ToString());
-	}
-
-	Napi::Object desc(Napi::Object::New(env));
-	desc.Set("logical_type", vec_type.ToString());
-	desc.Set("physical_type", TypeIdToString(vec_type.InternalType()));
-	desc.Set("validity_buffer", validity_buffer_index);
-	desc.Set("data_buffer", data_buffer_index);
-	desc.Set("length_buffer", length_buffer_index);
-	desc.Set("data_buffers", data_buffers);
-
-	return scope.Escape(desc);
-}
-
-void DuckDBNodeUDFLauncher(Napi::Env env, Napi::Function jsudf, nullptr_t *, JSArgs *jsargs) {
+void DuckDBNodeUDFLauncher(Napi::Env env, Napi::Function jsudf, std::nullptr_t *, JSArgs *jsargs) {
 	try { // if we dont catch exceptions here we terminate node if one happens ^^
+		Napi::EscapableHandleScope scope(env);
 
-		// set up descriptor and data arrays
-		Napi::Array args_descr(Napi::Array::New(env, jsargs->args->ColumnCount()));
-		for (duckdb::idx_t col_idx = 0; col_idx < jsargs->args->ColumnCount(); col_idx++) {
-			auto &vec = jsargs->args->data[col_idx];
-			auto arg_descr = transform_vector(env, vec, jsargs->rows, true);
-			args_descr.Set(col_idx, arg_descr);
-		}
-		auto ret_descr = transform_vector(env, *jsargs->result, jsargs->rows, false);
-
-		Napi::Object descr(Napi::Object::New(env));
+		// Set up descriptor and data arrays
+		auto descr = Napi::Object::New(env);
+		auto chunk = EncodeDataChunk(env, *jsargs->args, true, true);
+		descr.Set("args", scope.Escape(chunk));
 		descr.Set("rows", jsargs->rows);
-		descr.Set("args", args_descr);
-		descr.Set("ret", ret_descr);
+		auto ret = Napi::Object::New(env);
+		ret.Set("sqlType", jsargs->result->GetType().ToString());
+		auto ret_type = jsargs->result->GetType().InternalType();
+#if NAPI_VERSION <= 5
+		if (ret_type == duckdb::PhysicalType::INT64 || ret_type == duckdb::PhysicalType::UINT64) {
+			ret_type = duckdb::PhysicalType::DOUBLE;
+		}
+#endif
+		ret.Set("physicalType", TypeIdToString(ret_type));
+		descr.Set("ret", ret);
 
 		// actually call the UDF, or rather its vectorized wrapper from duckdb.js/Connection.prototype.register wrapper
 		jsudf({descr});
@@ -181,49 +151,87 @@ void DuckDBNodeUDFLauncher(Napi::Env env, Napi::Function jsudf, nullptr_t *, JSA
 		}
 
 		// transform the result back to a vector
-		auto return_validity = ret_descr.ToObject()
-		                           .Get("data_buffers")
-		                           .ToObject()
-		                           .Get(ret_descr.ToObject().Get("validity_buffer"))
-		                           .As<Napi::Buffer<uint8_t>>();
+		auto return_validity = ret.ToObject().Get("validity").As<Napi::Uint8Array>();
 		for (duckdb::idx_t row_idx = 0; row_idx < jsargs->rows; row_idx++) {
 			duckdb::FlatVector::SetNull(*jsargs->result, row_idx, !return_validity[row_idx]);
 		}
 
-		if (jsargs->result->GetType().id() == duckdb::LogicalTypeId::VARCHAR) {
-			auto return_string_array = ret_descr.ToObject()
-			                               .Get("data_buffers")
-			                               .ToObject()
-			                               .Get(ret_descr.ToObject().Get("data_buffer"))
-			                               .ToObject();
-			auto return_string_vec_ptr = duckdb::FlatVector::GetData<duckdb::string_t>(*jsargs->result);
-
-			for (duckdb::idx_t row_idx = 0; row_idx < jsargs->rows; row_idx++) {
-				if (!return_validity[row_idx]) {
-					duckdb::FlatVector::SetNull(*jsargs->result, row_idx, true);
-				} else {
-					auto str = return_string_array.Get(row_idx).As<Napi::String>();
-					return_string_vec_ptr[row_idx] = duckdb::StringVector::AddString(*jsargs->result, str);
-				}
-			}
-		} else {
-			auto return_data = ret_descr.ToObject()
-			                       .Get("data_buffers")
-			                       .ToObject()
-			                       .Get(ret_descr.ToObject().Get("data_buffer"))
-			                       .As<Napi::Buffer<uint8_t>>();
-			memcpy(duckdb::FlatVector::GetData<uint8_t>(*jsargs->result), return_data.Data(),
-			       jsargs->rows * duckdb::GetTypeIdSize(jsargs->result->GetType().InternalType()));
+		switch (jsargs->result->GetType().id()) {
+		case duckdb::LogicalTypeId::TINYINT: {
+			auto data = ret.Get("data").As<Napi::Int8Array>();
+			auto out = duckdb::FlatVector::GetData<int8_t>(*jsargs->result);
+			memcpy(out, data.Data(), jsargs->rows * duckdb::GetTypeIdSize(ret_type));
+			break;
 		}
+		case duckdb::LogicalTypeId::SMALLINT: {
+			auto data = ret.Get("data").As<Napi::Int16Array>();
+			auto out = duckdb::FlatVector::GetData<int16_t>(*jsargs->result);
+			memcpy(out, data.Data(), jsargs->rows * duckdb::GetTypeIdSize(ret_type));
+			break;
+		}
+		case duckdb::LogicalTypeId::INTEGER: {
+			auto data = ret.Get("data").As<Napi::Int32Array>();
+			auto out = duckdb::FlatVector::GetData<int32_t>(*jsargs->result);
+			memcpy(out, data.Data(), jsargs->rows * duckdb::GetTypeIdSize(ret_type));
+			break;
+		}
+		case duckdb::LogicalTypeId::DOUBLE: {
+			auto data = ret.Get("data").As<Napi::Float64Array>();
+			auto out = duckdb::FlatVector::GetData<double>(*jsargs->result);
+			memcpy(out, data.Data(), jsargs->rows * duckdb::GetTypeIdSize(ret_type));
+			break;
+		}
+		case duckdb::LogicalTypeId::TIME:
+		case duckdb::LogicalTypeId::TIMESTAMP:
+		case duckdb::LogicalTypeId::TIMESTAMP_MS:
+		case duckdb::LogicalTypeId::TIMESTAMP_SEC:
+		case duckdb::LogicalTypeId::TIMESTAMP_NS:
+		case duckdb::LogicalTypeId::BIGINT: {
+#if NAPI_VERSION > 5
+			auto data = ret.Get("data").As<Napi::BigInt64Array>();
+#else
+			auto data = ret.Get("data").As<Napi::Float64Array>();
+#endif
+			auto out = duckdb::FlatVector::GetData<int64_t>(*jsargs->result);
+			memcpy(out, data.Data(), jsargs->rows * duckdb::GetTypeIdSize(ret_type));
+			break;
+		}
+		case duckdb::LogicalTypeId::UBIGINT: {
+#if NAPI_VERSION > 5
+			auto data = ret.Get("data").As<Napi::BigUint64Array>();
+#else
+			auto data = ret.Get("data").As<Napi::Float64Array>();
+#endif
+			auto out = duckdb::FlatVector::GetData<uint64_t>(*jsargs->result);
+			memcpy(out, data.Data(), jsargs->rows * duckdb::GetTypeIdSize(ret_type));
+			break;
+		}
+		case duckdb::LogicalTypeId::BLOB:
+		case duckdb::LogicalTypeId::VARCHAR: {
+			auto data = ret.Get("data").As<Napi::Array>();
+			auto out = duckdb::FlatVector::GetData<duckdb::string_t>(*jsargs->result);
+			for (size_t i = 0; i < data.Length(); ++i) {
+				out[i] = duckdb::string_t(data.Get(i).ToString());
+			}
+			break;
+		}
+		default: {
+			for (duckdb::idx_t row_idx = 0; row_idx < jsargs->rows; row_idx++) {
+				duckdb::FlatVector::SetNull(*jsargs->result, row_idx, false);
+			}
+		}
+		}
+	} catch (const duckdb::Exception &e) {
+		jsargs->error = duckdb::PreservedError(e);
 	} catch (const std::exception &e) {
-		jsargs->error = e.what();
+		jsargs->error = duckdb::PreservedError(e);
 	}
 	jsargs->done = true;
 }
 
-struct RegisterTask : public Task {
-	RegisterTask(Connection &connection_, std::string name_, std::string return_type_name_, Napi::Function callback_)
-	    : Task(connection_, callback_), name(name_), return_type_name(return_type_name_) {
+struct RegisterUdfTask : public Task {
+	RegisterUdfTask(Connection &connection, std::string name, std::string return_type_name, Napi::Function callback)
+	    : Task(connection, callback), name(std::move(name)), return_type_name(std::move(return_type_name)) {
 	}
 
 	void DoWork() override {
@@ -234,7 +242,7 @@ struct RegisterTask : public Task {
 			// here we can do only DuckDB stuff because we do not have a functioning env
 
 			// Flatten all args to simplify udfs
-			args.Normalify();
+			args.Flatten();
 
 			JSArgs jsargs;
 			jsargs.rows = args.size();
@@ -246,8 +254,8 @@ struct RegisterTask : public Task {
 			while (!jsargs.done) {
 				std::this_thread::yield();
 			}
-			if (!jsargs.error.empty()) {
-				throw duckdb::IOException(jsargs.error);
+			if (jsargs.error) {
+				jsargs.error.Throw();
 			}
 		};
 
@@ -262,7 +270,7 @@ struct RegisterTask : public Task {
 	std::string return_type_name;
 };
 
-Napi::Value Connection::Register(const Napi::CallbackInfo &info) {
+Napi::Value Connection::RegisterUdf(const Napi::CallbackInfo &info) {
 	auto env = info.Env();
 	if (info.Length() < 3 || !info[0].IsString() || !info[1].IsString() || !info[2].IsFunction()) {
 		Napi::TypeError::New(env, "Holding it wrong").ThrowAsJavaScriptException();
@@ -282,8 +290,8 @@ Napi::Value Connection::Register(const Napi::CallbackInfo &info) {
 		return env.Null();
 	}
 
-	auto udf = DuckDBNodeUDFFUnction::New(env, udf_callback, "duckdb_node_udf" + name, 0, 1, nullptr,
-	                                      [](Napi::Env, void *, nullptr_t *ctx) {});
+	auto udf = duckdb_node_udf_function_t::New(env, udf_callback, "duckdb_node_udf" + name, 0, 1, nullptr,
+	                                           [](Napi::Env, void *, std::nullptr_t *ctx) {});
 
 	// we have to unref the udf because otherwise there is a circular ref with the connection somehow(?)
 	// this took far too long to figure out
@@ -291,14 +299,14 @@ Napi::Value Connection::Register(const Napi::CallbackInfo &info) {
 	udfs[name] = udf;
 
 	database_ref->Schedule(info.Env(),
-	                       duckdb::make_unique<RegisterTask>(*this, name, return_type_name, completion_callback));
+	                       duckdb::make_unique<RegisterUdfTask>(*this, name, return_type_name, completion_callback));
 
 	return Value();
 }
 
-struct UnregisterTask : public Task {
-	UnregisterTask(Connection &connection_, std::string name_, Napi::Function callback_)
-	    : Task(connection_, callback_), name(name_) {
+struct UnregisterUdfTask : public Task {
+	UnregisterUdfTask(Connection &connection, std::string name, Napi::Function callback)
+	    : Task(connection, callback), name(std::move(name)) {
 	}
 
 	void DoWork() override {
@@ -322,7 +330,7 @@ struct UnregisterTask : public Task {
 	std::string name;
 };
 
-Napi::Value Connection::Unregister(const Napi::CallbackInfo &info) {
+Napi::Value Connection::UnregisterUdf(const Napi::CallbackInfo &info) {
 	auto env = info.Env();
 	if (info.Length() < 1 || !info[0].IsString()) {
 		Napi::TypeError::New(env, "Holding it wrong").ThrowAsJavaScriptException();
@@ -335,37 +343,63 @@ Napi::Value Connection::Unregister(const Napi::CallbackInfo &info) {
 		callback = info[1].As<Napi::Function>();
 	}
 
-	database_ref->Schedule(info.Env(), duckdb::make_unique<UnregisterTask>(*this, name, callback));
+	database_ref->Schedule(info.Env(), duckdb::make_unique<UnregisterUdfTask>(*this, name, callback));
 	return Value();
 }
 
 struct ExecTask : public Task {
-	ExecTask(Connection &connection_, std::string sql_, Napi::Function callback_)
-	    : Task(connection_, callback_), sql(sql_) {
+	ExecTask(Connection &connection, std::string sql, Napi::Function callback)
+	    : Task(connection, callback), sql(std::move(sql)) {
 	}
 
 	void DoWork() override {
 		auto &connection = Get<Connection>();
 
 		success = true;
-		auto statements = connection.connection->ExtractStatements(sql);
-		if (statements.size() == 0) {
+		try {
+			auto statements = connection.connection->ExtractStatements(sql);
+			if (statements.empty()) {
+				return;
+			}
+
+			for (duckdb::idx_t i = 0; i < statements.size(); i++) {
+				auto res = connection.connection->Query(move(statements[i]));
+				if (res->HasError()) {
+					success = false;
+					error = res->GetErrorObject();
+					break;
+				}
+			}
+		} catch (duckdb::ParserException &e) {
+			success = false;
+			error = duckdb::PreservedError(e);
 			return;
 		}
-
-		// thanks Mark
-		for (duckdb::idx_t i = 0; i < statements.size(); i++) {
-			auto res = connection.connection->Query(move(statements[i]));
-			if (!res->success) {
-				success = false;
-				error = res->error;
-				break;
-			}
-		}
 	}
+
+	void Callback() override {
+		auto env = object.Env();
+		Napi::HandleScope scope(env);
+		callback.Value().MakeCallback(object.Value(), {success ? env.Null() : Napi::String::New(env, error.Message())});
+	};
+
 	std::string sql;
 	bool success;
-	std::string error;
+	duckdb::PreservedError error;
+};
+
+struct ExecTaskWithCallback : public ExecTask {
+	ExecTaskWithCallback(Connection &connection, std::string sql, Napi::Function js_callback,
+	                     std::function<void(void)> cpp_callback)
+	    : ExecTask(connection, sql, js_callback), cpp_callback(cpp_callback) {
+	}
+
+	void Callback() override {
+		cpp_callback();
+		ExecTask::Callback();
+	};
+
+	std::function<void(void)> cpp_callback;
 };
 
 Napi::Value Connection::Exec(const Napi::CallbackInfo &info) {
@@ -384,6 +418,92 @@ Napi::Value Connection::Exec(const Napi::CallbackInfo &info) {
 	}
 
 	database_ref->Schedule(info.Env(), duckdb::make_unique<ExecTask>(*this, sql, callback));
+	return Value();
+}
+
+// Register Arrow IPC buffers for scanning from DuckDB
+Napi::Value Connection::RegisterBuffer(const Napi::CallbackInfo &info) {
+	auto env = info.Env();
+
+	if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
+		Napi::TypeError::New(env, "Incorrect params").ThrowAsJavaScriptException();
+		return env.Null();
+	}
+
+	std::string name = info[0].As<Napi::String>();
+	Napi::Array array = info[1].As<Napi::Array>();
+	bool force_register = false;
+
+	if (info.Length() > 2) {
+		if (!info[2].IsBoolean()) {
+			Napi::TypeError::New(env, "Parameter 3 is of unexpected type. Expected boolean")
+			    .ThrowAsJavaScriptException();
+			return env.Null();
+		}
+		force_register = info[2].As<Napi::Boolean>().Value();
+	}
+
+	if (!force_register && array_references.find(name) != array_references.end()) {
+		Napi::TypeError::New(env, "Buffer with this name already exists and force_register is not enabled")
+		    .ThrowAsJavaScriptException();
+		return env.Null();
+	}
+
+	array_references[name] = Napi::Persistent(array);
+
+	std::string arrow_scan_function = "scan_arrow_ipc([";
+
+	for (uint64_t ipc_idx = 0; ipc_idx < array.Length(); ipc_idx++) {
+		Napi::Value v = array[ipc_idx];
+		if (!v.IsObject()) {
+			Napi::TypeError::New(env, "Parameter 2 contains unexpected type at index " + std::to_string(ipc_idx))
+			    .ThrowAsJavaScriptException();
+			return env.Null();
+		}
+		Napi::Uint8Array arr = v.As<Napi::Uint8Array>();
+		auto raw_ptr = reinterpret_cast<uint64_t>(arr.ArrayBuffer().Data());
+		auto length = (uint64_t)arr.ElementLength();
+
+		arrow_scan_function += "{'ptr': " + std::to_string(raw_ptr) + ", 'size': " + std::to_string(length) + "},";
+	}
+	arrow_scan_function += "])";
+
+	std::string final_query = "CREATE OR REPLACE TEMPORARY VIEW " + name + " AS SELECT * FROM " + arrow_scan_function;
+
+	Napi::Function callback;
+	if (info.Length() > 3 && info[3].IsFunction()) {
+		callback = info[3].As<Napi::Function>();
+	}
+
+	database_ref->Schedule(info.Env(), duckdb::make_unique<ExecTask>(*this, final_query, callback));
+
+	return Value();
+}
+
+Napi::Value Connection::UnRegisterBuffer(const Napi::CallbackInfo &info) {
+	auto env = info.Env();
+
+	if (info.Length() < 1 || !info[0].IsString()) {
+		Napi::TypeError::New(env, "Incorrect params").ThrowAsJavaScriptException();
+		return env.Null();
+	}
+	std::string name = info[0].As<Napi::String>();
+
+	std::string final_query = "DROP VIEW IF EXISTS " + name;
+
+	Napi::Function callback;
+	if (info.Length() > 1 && info[1].IsFunction()) {
+		callback = info[1].As<Napi::Function>();
+	}
+
+	// When query succeeds we can safely delete the ref
+	std::function<void(void)> cpp_callback = [&, name]() {
+		array_references.erase(name);
+	};
+
+	database_ref->Schedule(info.Env(),
+	                       duckdb::make_unique<ExecTaskWithCallback>(*this, final_query, callback, cpp_callback));
+
 	return Value();
 }
 

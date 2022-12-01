@@ -5,7 +5,7 @@ namespace duckdb {
 static void CheckPath(const Value &path_val, string &path, size_t &len) {
 	string error;
 	Value path_str_val;
-	if (!path_val.TryCastAs(LogicalType::VARCHAR, path_str_val, &error)) {
+	if (!path_val.DefaultTryCastAs(LogicalType::VARCHAR, path_str_val, &error)) {
 		throw InvalidInputException(error);
 	}
 	auto path_str = path_str_val.GetValueUnsafe<string_t>();
@@ -48,7 +48,7 @@ unique_ptr<FunctionData> JSONReadFunctionData::Bind(ClientContext &context, Scal
 	size_t len = 0;
 	if (arguments[1]->return_type.id() != LogicalTypeId::SQLNULL && arguments[1]->IsFoldable()) {
 		constant = true;
-		const auto path_val = ExpressionExecutor::EvaluateScalar(*arguments[1]);
+		const auto path_val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
 		CheckPath(path_val, path, len);
 	}
 	return make_unique<JSONReadFunctionData>(constant, move(path), len);
@@ -73,6 +73,9 @@ bool JSONReadManyFunctionData::Equals(const FunctionData &other_p) const {
 unique_ptr<FunctionData> JSONReadManyFunctionData::Bind(ClientContext &context, ScalarFunction &bound_function,
                                                         vector<unique_ptr<Expression>> &arguments) {
 	D_ASSERT(bound_function.arguments.size() == 2);
+	if (arguments[1]->HasParameter()) {
+		throw ParameterNotResolvedException();
+	}
 	if (!arguments[1]->IsFoldable()) {
 		throw InvalidInputException("List of paths must be constant");
 	}
@@ -82,7 +85,7 @@ unique_ptr<FunctionData> JSONReadManyFunctionData::Bind(ClientContext &context, 
 
 	vector<string> paths;
 	vector<size_t> lens;
-	auto paths_val = ExpressionExecutor::EvaluateScalar(*arguments[1]);
+	auto paths_val = ExpressionExecutor::EvaluateScalar(context, *arguments[1]);
 	for (auto &path_val : ListValue::GetChildren(paths_val)) {
 		paths.emplace_back("");
 		lens.push_back(0);

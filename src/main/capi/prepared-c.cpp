@@ -1,11 +1,13 @@
-#include "duckdb/main/capi_internal.hpp"
+#include "duckdb/main/capi/capi_internal.hpp"
 #include "duckdb/main/query_result.hpp"
 #include "duckdb/main/prepared_statement_data.hpp"
+#include "duckdb/common/types/decimal.hpp"
 
 using duckdb::Connection;
 using duckdb::date_t;
 using duckdb::dtime_t;
 using duckdb::hugeint_t;
+using duckdb::LogicalType;
 using duckdb::MaterializedQueryResult;
 using duckdb::PreparedStatementWrapper;
 using duckdb::QueryResultType;
@@ -21,20 +23,20 @@ duckdb_state duckdb_prepare(duckdb_connection connection, const char *query,
 	Connection *conn = (Connection *)connection;
 	wrapper->statement = conn->Prepare(query);
 	*out_prepared_statement = (duckdb_prepared_statement)wrapper;
-	return wrapper->statement->success ? DuckDBSuccess : DuckDBError;
+	return !wrapper->statement->HasError() ? DuckDBSuccess : DuckDBError;
 }
 
 const char *duckdb_prepare_error(duckdb_prepared_statement prepared_statement) {
 	auto wrapper = (PreparedStatementWrapper *)prepared_statement;
-	if (!wrapper || !wrapper->statement || wrapper->statement->success) {
+	if (!wrapper || !wrapper->statement || !wrapper->statement->HasError()) {
 		return nullptr;
 	}
-	return wrapper->statement->error.c_str();
+	return wrapper->statement->error.Message().c_str();
 }
 
 idx_t duckdb_nparams(duckdb_prepared_statement prepared_statement) {
 	auto wrapper = (PreparedStatementWrapper *)prepared_statement;
-	if (!wrapper || !wrapper->statement || !wrapper->statement->success) {
+	if (!wrapper || !wrapper->statement || wrapper->statement->HasError()) {
 		return 0;
 	}
 	return wrapper->statement->n_param;
@@ -42,19 +44,28 @@ idx_t duckdb_nparams(duckdb_prepared_statement prepared_statement) {
 
 duckdb_type duckdb_param_type(duckdb_prepared_statement prepared_statement, idx_t param_idx) {
 	auto wrapper = (PreparedStatementWrapper *)prepared_statement;
-	if (!wrapper || !wrapper->statement || !wrapper->statement->success) {
+	if (!wrapper || !wrapper->statement || wrapper->statement->HasError()) {
 		return DUCKDB_TYPE_INVALID;
 	}
-	auto entry = wrapper->statement->data->value_map.find(param_idx);
-	if (entry == wrapper->statement->data->value_map.end()) {
+	LogicalType param_type;
+	if (!wrapper->statement->data->TryGetType(param_idx, param_type)) {
 		return DUCKDB_TYPE_INVALID;
 	}
-	return ConvertCPPTypeToC(entry->second[0]->type());
+	return ConvertCPPTypeToC(param_type);
+}
+
+duckdb_state duckdb_clear_bindings(duckdb_prepared_statement prepared_statement) {
+	auto wrapper = (PreparedStatementWrapper *)prepared_statement;
+	if (!wrapper || !wrapper->statement || wrapper->statement->HasError()) {
+		return DuckDBError;
+	}
+	wrapper->values.clear();
+	return DuckDBSuccess;
 }
 
 static duckdb_state duckdb_bind_value(duckdb_prepared_statement prepared_statement, idx_t param_idx, Value val) {
 	auto wrapper = (PreparedStatementWrapper *)prepared_statement;
-	if (!wrapper || !wrapper->statement || !wrapper->statement->success) {
+	if (!wrapper || !wrapper->statement || wrapper->statement->HasError()) {
 		return DuckDBError;
 	}
 	if (param_idx <= 0 || param_idx > wrapper->statement->n_param) {
@@ -87,11 +98,15 @@ duckdb_state duckdb_bind_int64(duckdb_prepared_statement prepared_statement, idx
 	return duckdb_bind_value(prepared_statement, param_idx, Value::BIGINT(val));
 }
 
-duckdb_state duckdb_bind_hugeint(duckdb_prepared_statement prepared_statement, idx_t param_idx, duckdb_hugeint val) {
+static hugeint_t duckdb_internal_hugeint(duckdb_hugeint val) {
 	hugeint_t internal;
 	internal.lower = val.lower;
 	internal.upper = val.upper;
-	return duckdb_bind_value(prepared_statement, param_idx, Value::HUGEINT(internal));
+	return internal;
+}
+
+duckdb_state duckdb_bind_hugeint(duckdb_prepared_statement prepared_statement, idx_t param_idx, duckdb_hugeint val) {
+	return duckdb_bind_value(prepared_statement, param_idx, Value::HUGEINT(duckdb_internal_hugeint(val)));
 }
 
 duckdb_state duckdb_bind_uint8(duckdb_prepared_statement prepared_statement, idx_t param_idx, uint8_t val) {
@@ -152,6 +167,15 @@ duckdb_state duckdb_bind_varchar_length(duckdb_prepared_statement prepared_state
 	}
 }
 
+duckdb_state duckdb_bind_decimal(duckdb_prepared_statement prepared_statement, idx_t param_idx, duckdb_decimal val) {
+	auto hugeint_val = duckdb_internal_hugeint(val.value);
+	if (val.width > duckdb::Decimal::MAX_WIDTH_INT64) {
+		return duckdb_bind_value(prepared_statement, param_idx, Value::DECIMAL(hugeint_val, val.width, val.scale));
+	}
+	auto value = hugeint_val.lower;
+	return duckdb_bind_value(prepared_statement, param_idx, Value::DECIMAL((int64_t)value, val.width, val.scale));
+}
+
 duckdb_state duckdb_bind_blob(duckdb_prepared_statement prepared_statement, idx_t param_idx, const void *data,
                               idx_t length) {
 	return duckdb_bind_value(prepared_statement, param_idx, Value::BLOB((duckdb::const_data_ptr_t)data, length));
@@ -163,7 +187,7 @@ duckdb_state duckdb_bind_null(duckdb_prepared_statement prepared_statement, idx_
 
 duckdb_state duckdb_execute_prepared(duckdb_prepared_statement prepared_statement, duckdb_result *out_result) {
 	auto wrapper = (PreparedStatementWrapper *)prepared_statement;
-	if (!wrapper || !wrapper->statement || !wrapper->statement->success) {
+	if (!wrapper || !wrapper->statement || wrapper->statement->HasError()) {
 		return DuckDBError;
 	}
 	auto result = wrapper->statement->Execute(wrapper->values, false);

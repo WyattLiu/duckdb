@@ -17,14 +17,13 @@
  * under the License.
  */
 
-#ifndef _THRIFT_TRANSPORT_TBUFFERTRANSPORTS_H_
-#define _THRIFT_TRANSPORT_TBUFFERTRANSPORTS_H_ 1
+#ifndef _DUCKDB_THRIFT_TRANSPORT_TBUFFERTRANSPORTS_H_
+#define _DUCKDB_THRIFT_TRANSPORT_TBUFFERTRANSPORTS_H_ 1
 
 #include <cstdlib>
 #include <cstddef>
 #include <cstring>
 #include <limits>
-//#include <boost/scoped_array.hpp> // FUCK OFF
 
 #include "thrift/transport/TTransport.h"
 #include "thrift/transport/TVirtualTransport.h"
@@ -486,4 +485,4 @@ protected:
 }
 } // duckdb_apache::thrift::transport
 
-#endif // #ifndef _THRIFT_TRANSPORT_TBUFFERTRANSPORTS_H_
+#endif // #ifndef _DUCKDB_THRIFT_TRANSPORT_TBUFFERTRANSPORTS_H_

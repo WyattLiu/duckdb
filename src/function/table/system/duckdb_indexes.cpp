@@ -10,7 +10,7 @@
 
 namespace duckdb {
 
-struct DuckDBIndexesData : public FunctionOperatorData {
+struct DuckDBIndexesData : public GlobalTableFunctionState {
 	DuckDBIndexesData() : offset(0) {
 	}
 
@@ -53,8 +53,7 @@ static unique_ptr<FunctionData> DuckDBIndexesBind(ClientContext &context, TableF
 	return nullptr;
 }
 
-unique_ptr<FunctionOperatorData> DuckDBIndexesInit(ClientContext &context, const FunctionData *bind_data,
-                                                   const vector<column_t> &column_ids, TableFilterCollection *filters) {
+unique_ptr<GlobalTableFunctionState> DuckDBIndexesInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_unique<DuckDBIndexesData>();
 
 	// scan all the schemas for tables and collect themand collect them
@@ -64,14 +63,13 @@ unique_ptr<FunctionOperatorData> DuckDBIndexesInit(ClientContext &context, const
 	};
 
 	// check the temp schema as well
-	ClientData::Get(context).temporary_objects->Scan(context, CatalogType::INDEX_ENTRY,
-	                                                 [&](CatalogEntry *entry) { result->entries.push_back(entry); });
+	SchemaCatalogEntry::GetTemporaryObjects(context)->Scan(
+	    context, CatalogType::INDEX_ENTRY, [&](CatalogEntry *entry) { result->entries.push_back(entry); });
 	return move(result);
 }
 
-void DuckDBIndexesFunction(ClientContext &context, const FunctionData *bind_data, FunctionOperatorData *operator_state,
-                           DataChunk &output) {
-	auto &data = (DuckDBIndexesData &)*operator_state;
+void DuckDBIndexesFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = (DuckDBIndexesData &)*data_p.global_state;
 	if (data.offset >= data.entries.size()) {
 		// finished returning values
 		return;

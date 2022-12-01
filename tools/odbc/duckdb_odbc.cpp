@@ -118,15 +118,14 @@ void OdbcHandleStmt::Close() {
 	// the parameter values can be reused after
 	param_desc->Reset();
 	// stmt->stmt.reset(); // the statment can be reuse in prepared statement
-	bound_cols.clear();
 	error_messages.clear();
 }
 
 SQLRETURN OdbcHandleStmt::MaterializeResult() {
-	if (!stmt || !stmt->success) {
+	if (!stmt || stmt->HasError()) {
 		return SQL_SUCCESS;
 	}
-	if (!res || !res->success) {
+	if (!res || res->HasError()) {
 		return SQL_SUCCESS;
 	}
 	return odbc_fetcher->Materialize(this);

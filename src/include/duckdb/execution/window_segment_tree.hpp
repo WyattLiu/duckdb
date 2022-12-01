@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include "duckdb/common/types/chunk_collection.hpp"
+#include "duckdb/common/types/data_chunk.hpp"
 #include "duckdb/execution/physical_operator.hpp"
 #include "duckdb/function/aggregate_function.hpp"
 #include "duckdb/common/enums/window_aggregation_mode.hpp"
@@ -20,7 +20,7 @@ public:
 	using FrameBounds = std::pair<idx_t, idx_t>;
 
 	WindowSegmentTree(AggregateFunction &aggregate, FunctionData *bind_info, const LogicalType &result_type,
-	                  ChunkCollection *input, WindowAggregationMode mode);
+	                  DataChunk *input, const ValidityMask &filter_mask, WindowAggregationMode mode);
 	~WindowSegmentTree();
 
 	//! First row contains the result.
@@ -53,12 +53,12 @@ private:
 	vector<data_t> state;
 	//! Input data chunk, used for intermediate window segment aggregation
 	DataChunk inputs;
+	//! The filtered rows in inputs.
+	SelectionVector filter_sel;
 	//! A vector of pointers to "state", used for intermediate window segment aggregation
 	Vector statep;
 	//! The frame boundaries, used for the window functions
 	FrameBounds frame;
-	//! The active data in the inputs. Used for the window functions
-	FrameBounds active;
 	//! Reused result state container for the window functions
 	Vector statev;
 
@@ -71,7 +71,10 @@ private:
 	idx_t internal_nodes;
 
 	//! The (sorted) input chunk collection on which the tree is built
-	ChunkCollection *input_ref;
+	DataChunk *input_ref;
+
+	//! The filtered rows in input_ref.
+	const ValidityMask &filter_mask;
 
 	//! Use the window API, if available
 	WindowAggregationMode mode;

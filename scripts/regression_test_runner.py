@@ -10,7 +10,7 @@ number_repetitions = 5
 # the threshold at which we consider something a regression (percentage)
 regression_threshold_percentage = 0.1
 # minimal seconds diff for something to be a regression (for very fast benchmarks)
-regression_threshold_seconds = 0.01
+regression_threshold_seconds = 0.05
 
 old_runner = None
 new_runner = None
@@ -26,8 +26,8 @@ for arg in sys.argv:
         benchmark_file = arg.replace("--benchmarks=", "")
     elif arg == "--verbose":
         verbose = True
-    elif arg == "--threads=":
-        threads = int(arg.replace("--threads="))
+    elif arg.startswith("--threads="):
+        threads = int(arg.replace("--threads=", ""))
 
 if old_runner is None or new_runner is None or benchmark_file is None:
     print("Expected usage: python3 scripts/regression_test_runner.py --old=/old/benchmark_runner --new=/new/benchmark_runner --benchmarks=/benchmark/list.csv")

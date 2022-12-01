@@ -49,6 +49,10 @@ public:
 	bool IsSink() const override {
 		return true;
 	}
+
+public:
+	void BuildPipelines(Pipeline &current, MetaPipeline &meta_pipeline) override;
+	vector<const PhysicalOperator *> GetSources() const override;
 };
 
 } // namespace duckdb

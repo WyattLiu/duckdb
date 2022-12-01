@@ -16,18 +16,23 @@ add_library_unity(
   client_context_file_opener.cpp
   client_context.cpp
   client_data.cpp
+  client_verify.cpp
   config.cpp
   connection.cpp
   database.cpp
+  db_instance_cache.cpp
+  error_manager.cpp
   extension.cpp
   materialized_query_result.cpp
   pending_query_result.cpp
   prepared_statement.cpp
   prepared_statement_data.cpp
   relation.cpp
+  extension_prefix_opener.cpp
   query_profiler.cpp
   query_result.cpp
-  stream_query_result.cpp)
+  stream_query_result.cpp
+  valid_checker.cpp)
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:duckdb_main>
     PARENT_SCOPE)

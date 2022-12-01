@@ -12,7 +12,7 @@
 
 namespace duckdb {
 
-struct DuckDBColumnsData : public FunctionOperatorData {
+struct DuckDBColumnsData : public GlobalTableFunctionState {
 	DuckDBColumnsData() : offset(0), column_offset(0) {
 	}
 
@@ -71,8 +71,7 @@ static unique_ptr<FunctionData> DuckDBColumnsBind(ClientContext &context, TableF
 	return nullptr;
 }
 
-unique_ptr<FunctionOperatorData> DuckDBColumnsInit(ClientContext &context, const FunctionData *bind_data,
-                                                   const vector<column_t> &column_ids, TableFilterCollection *filters) {
+unique_ptr<GlobalTableFunctionState> DuckDBColumnsInit(ClientContext &context, TableFunctionInitInput &input) {
 	auto result = make_unique<DuckDBColumnsData>();
 
 	// scan all the schemas for tables and views and collect them
@@ -82,12 +81,10 @@ unique_ptr<FunctionOperatorData> DuckDBColumnsInit(ClientContext &context, const
 	}
 
 	// check the temp schema as well
-	ClientData::Get(context).temporary_objects->Scan(context, CatalogType::TABLE_ENTRY,
-	                                                 [&](CatalogEntry *entry) { result->entries.push_back(entry); });
+	SchemaCatalogEntry::GetTemporaryObjects(context)->Scan(
+	    context, CatalogType::TABLE_ENTRY, [&](CatalogEntry *entry) { result->entries.push_back(entry); });
 	return move(result);
 }
-
-namespace { // anonymous namespace for the ColumnHelper classes for working with tables/views
 
 class ColumnHelper {
 public:
@@ -112,7 +109,7 @@ public:
 		for (auto &constraint : entry->constraints) {
 			if (constraint->type == ConstraintType::NOT_NULL) {
 				auto &not_null = *reinterpret_cast<NotNullConstraint *>(constraint.get());
-				not_null_cols.insert(not_null.index);
+				not_null_cols.insert(not_null.index.index);
 			}
 		}
 	}
@@ -121,17 +118,18 @@ public:
 		return entry;
 	}
 	idx_t NumColumns() override {
-		return entry->columns.size();
+		return entry->columns.LogicalColumnCount();
 	}
 	const string &ColumnName(idx_t col) override {
-		return entry->columns[col].name;
+		return entry->columns.GetColumn(LogicalIndex(col)).Name();
 	}
 	const LogicalType &ColumnType(idx_t col) override {
-		return entry->columns[col].type;
+		return entry->columns.GetColumn(LogicalIndex(col)).Type();
 	}
 	const Value ColumnDefault(idx_t col) override {
-		if (entry->columns[col].default_value) {
-			return Value(entry->columns[col].default_value->ToString());
+		auto &column = entry->columns.GetColumn(LogicalIndex(col));
+		if (column.DefaultValue()) {
+			return Value(column.DefaultValue()->ToString());
 		}
 		return Value();
 	}
@@ -278,11 +276,8 @@ void ColumnHelper::WriteColumns(idx_t start_index, idx_t start_col, idx_t end_co
 	}
 }
 
-} // anonymous namespace
-
-void DuckDBColumnsFunction(ClientContext &context, const FunctionData *bind_data, FunctionOperatorData *operator_state,
-                           DataChunk &output) {
-	auto &data = (DuckDBColumnsData &)*operator_state;
+void DuckDBColumnsFunction(ClientContext &context, TableFunctionInput &data_p, DataChunk &output) {
+	auto &data = (DuckDBColumnsData &)*data_p.global_state;
 	if (data.offset >= data.entries.size()) {
 		// finished returning values
 		return;

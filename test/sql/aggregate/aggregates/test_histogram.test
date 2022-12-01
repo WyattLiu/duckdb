@@ -21,6 +21,12 @@ select histogram(1)
 ----
 {1=1}
 
+# Allow ascii characters in strings
+query I
+SELECT histogram('、')
+----
+{、=1}
+
 query I
 SELECT histogram(2) FROM range(100);
 ----
@@ -100,8 +106,6 @@ SELECT histogram(CAST('2022-01-02' AS DATE));
 ----
 {2022-01-02=1}
 
-require vector_size 512
-
 query II rowsort
 select g,histogram(g) over (partition by g%2)
     from hist_data;
@@ -120,3 +124,18 @@ select histogram()
 
 statement error
 select histogram(*)
+
+# enums
+statement ok
+CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy')
+
+statement ok
+CREATE TABLE enums (e mood)
+
+statement ok
+INSERT INTO enums VALUES ('happy'), ('ok')
+
+query I
+SELECT histogram(e) FROM enums
+----
+{happy=1, ok=1}

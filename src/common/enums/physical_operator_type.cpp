@@ -11,6 +11,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "DUMMY_SCAN";
 	case PhysicalOperatorType::CHUNK_SCAN:
 		return "CHUNK_SCAN";
+	case PhysicalOperatorType::COLUMN_DATA_SCAN:
+		return "COLUMN_DATA_SCAN";
 	case PhysicalOperatorType::DELIM_SCAN:
 		return "DELIM_SCAN";
 	case PhysicalOperatorType::ORDER_BY:
@@ -19,6 +21,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "LIMIT";
 	case PhysicalOperatorType::LIMIT_PERCENT:
 		return "LIMIT_PERCENT";
+	case PhysicalOperatorType::STREAMING_LIMIT:
+		return "STREAMING_LIMIT";
 	case PhysicalOperatorType::RESERVOIR_SAMPLE:
 		return "RESERVOIR_SAMPLE";
 	case PhysicalOperatorType::STREAMING_SAMPLE:
@@ -31,8 +35,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "STREAMING_WINDOW";
 	case PhysicalOperatorType::UNNEST:
 		return "UNNEST";
-	case PhysicalOperatorType::SIMPLE_AGGREGATE:
-		return "SIMPLE_AGGREGATE";
+	case PhysicalOperatorType::UNGROUPED_AGGREGATE:
+		return "UNGROUPED_AGGREGATE";
 	case PhysicalOperatorType::HASH_GROUP_BY:
 		return "HASH_GROUP_BY";
 	case PhysicalOperatorType::PERFECT_HASH_GROUP_BY:
@@ -63,6 +67,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "UNION";
 	case PhysicalOperatorType::INSERT:
 		return "INSERT";
+	case PhysicalOperatorType::BATCH_INSERT:
+		return "BATCH_INSERT";
 	case PhysicalOperatorType::DELETE_OPERATOR:
 		return "DELETE";
 	case PhysicalOperatorType::UPDATE:
@@ -73,6 +79,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "CREATE_TABLE";
 	case PhysicalOperatorType::CREATE_TABLE_AS:
 		return "CREATE_TABLE_AS";
+	case PhysicalOperatorType::BATCH_CREATE_TABLE_AS:
+		return "BATCH_CREATE_TABLE_AS";
 	case PhysicalOperatorType::CREATE_INDEX:
 		return "CREATE_INDEX";
 	case PhysicalOperatorType::EXPLAIN:
@@ -117,6 +125,8 @@ string PhysicalOperatorToString(PhysicalOperatorType type) {
 		return "INOUT_FUNCTION";
 	case PhysicalOperatorType::CREATE_TYPE:
 		return "CREATE_TYPE";
+	case PhysicalOperatorType::RESULT_COLLECTOR:
+		return "RESULT_COLLECTOR";
 	case PhysicalOperatorType::INVALID:
 		break;
 	}

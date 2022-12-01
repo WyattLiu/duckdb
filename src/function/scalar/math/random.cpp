@@ -9,21 +9,6 @@
 
 namespace duckdb {
 
-struct RandomBindData : public FunctionData {
-	ClientContext &context;
-
-	explicit RandomBindData(ClientContext &context) : context(context) {
-	}
-
-	unique_ptr<FunctionData> Copy() const override {
-		return make_unique<RandomBindData>(context);
-	}
-
-	bool Equals(const FunctionData &other_p) const override {
-		return true;
-	}
-};
-
 struct RandomLocalState : public FunctionLocalState {
 	explicit RandomLocalState(uint32_t seed) : random_engine(seed) {
 	}
@@ -42,21 +27,18 @@ static void RandomFunction(DataChunk &args, ExpressionState &state, Vector &resu
 	}
 }
 
-unique_ptr<FunctionData> RandomBind(ClientContext &context, ScalarFunction &bound_function,
-                                    vector<unique_ptr<Expression>> &arguments) {
-	return make_unique<RandomBindData>(context);
-}
-
-static unique_ptr<FunctionLocalState> RandomInitLocalState(const BoundFunctionExpression &expr,
+static unique_ptr<FunctionLocalState> RandomInitLocalState(ExpressionState &state, const BoundFunctionExpression &expr,
                                                            FunctionData *bind_data) {
-	auto &info = (RandomBindData &)*bind_data;
-	auto &random_engine = RandomEngine::Get(info.context);
+	auto &random_engine = RandomEngine::Get(state.GetContext());
+	lock_guard<mutex> guard(random_engine.lock);
 	return make_unique<RandomLocalState>(random_engine.NextRandomInteger());
 }
 
 void RandomFun::RegisterFunction(BuiltinFunctions &set) {
-	set.AddFunction(ScalarFunction("random", {}, LogicalType::DOUBLE, RandomFunction, true, RandomBind, nullptr,
-	                               nullptr, RandomInitLocalState));
+	ScalarFunction random("random", {}, LogicalType::DOUBLE, RandomFunction, nullptr, nullptr, nullptr,
+	                      RandomInitLocalState);
+	random.side_effects = FunctionSideEffects::HAS_SIDE_EFFECTS;
+	set.AddFunction(random);
 }
 
 static void GenerateUUIDFunction(DataChunk &args, ExpressionState &state, Vector &result) {
@@ -67,42 +49,15 @@ static void GenerateUUIDFunction(DataChunk &args, ExpressionState &state, Vector
 	auto result_data = FlatVector::GetData<hugeint_t>(result);
 
 	for (idx_t i = 0; i < args.size(); i++) {
-		uint8_t bytes[16];
-		for (int i = 0; i < 16; i += 4) {
-			*reinterpret_cast<uint32_t *>(bytes + i) = lstate.random_engine.NextRandomInteger();
-		}
-		// variant must be 10xxxxxx
-		bytes[8] &= 0xBF;
-		bytes[8] |= 0x80;
-		// version must be 0100xxxx
-		bytes[6] &= 0x4F;
-		bytes[6] |= 0x40;
-
-		result_data[i].upper = 0;
-		result_data[i].upper |= ((int64_t)bytes[0] << 56);
-		result_data[i].upper |= ((int64_t)bytes[1] << 48);
-		result_data[i].upper |= ((int64_t)bytes[3] << 40);
-		result_data[i].upper |= ((int64_t)bytes[4] << 32);
-		result_data[i].upper |= ((int64_t)bytes[5] << 24);
-		result_data[i].upper |= ((int64_t)bytes[6] << 16);
-		result_data[i].upper |= ((int64_t)bytes[7] << 8);
-		result_data[i].upper |= bytes[8];
-		result_data[i].lower = 0;
-		result_data[i].lower |= ((uint64_t)bytes[8] << 56);
-		result_data[i].lower |= ((uint64_t)bytes[9] << 48);
-		result_data[i].lower |= ((uint64_t)bytes[10] << 40);
-		result_data[i].lower |= ((uint64_t)bytes[11] << 32);
-		result_data[i].lower |= ((uint64_t)bytes[12] << 24);
-		result_data[i].lower |= ((uint64_t)bytes[13] << 16);
-		result_data[i].lower |= ((uint64_t)bytes[14] << 8);
-		result_data[i].lower |= bytes[15];
+		result_data[i] = UUID::GenerateRandomUUID(lstate.random_engine);
 	}
 }
 
 void UUIDFun::RegisterFunction(BuiltinFunctions &set) {
-	ScalarFunction uuid_function({}, LogicalType::UUID, GenerateUUIDFunction, false, true, RandomBind, nullptr, nullptr,
+	ScalarFunction uuid_function({}, LogicalType::UUID, GenerateUUIDFunction, nullptr, nullptr, nullptr,
 	                             RandomInitLocalState);
 	// generate a random uuid
+	uuid_function.side_effects = FunctionSideEffects::HAS_SIDE_EFFECTS;
 	set.AddFunction({"uuid", "gen_random_uuid"}, uuid_function);
 }
 

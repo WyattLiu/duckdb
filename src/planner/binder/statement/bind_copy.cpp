@@ -14,7 +14,7 @@
 #include "duckdb/parser/expression/star_expression.hpp"
 #include "duckdb/parser/tableref/basetableref.hpp"
 #include "duckdb/parser/query_node/select_node.hpp"
-#include "duckdb/execution/operator/persistent/buffered_csv_reader.hpp"
+#include "duckdb/execution/operator/persistent/parallel_csv_reader.hpp"
 #include "duckdb/function/table/read_csv.hpp"
 #include <algorithm>
 
@@ -23,7 +23,7 @@ namespace duckdb {
 BoundStatement Binder::BindCopyTo(CopyStatement &stmt) {
 	// COPY TO a file
 	auto &config = DBConfig::GetConfig(context);
-	if (!config.enable_external_access) {
+	if (!config.options.enable_external_access) {
 		throw PermissionException("COPY TO is disabled by configuration");
 	}
 	BoundStatement result;
@@ -43,7 +43,7 @@ BoundStatement Binder::BindCopyTo(CopyStatement &stmt) {
 	for (auto &option : stmt.info->options) {
 		auto loption = StringUtil::Lower(option.first);
 		if (loption == "use_tmp_file") {
-			use_tmp_file = option.second[0].CastAs(LogicalType::BOOLEAN).GetValue<bool>();
+			use_tmp_file = option.second[0].CastAs(context, LogicalType::BOOLEAN).GetValue<bool>();
 			stmt.info->options.erase(option.first);
 			break;
 		}
@@ -65,7 +65,7 @@ BoundStatement Binder::BindCopyTo(CopyStatement &stmt) {
 
 BoundStatement Binder::BindCopyFrom(CopyStatement &stmt) {
 	auto &config = DBConfig::GetConfig(context);
-	if (!config.enable_external_access) {
+	if (!config.options.enable_external_access) {
 		throw PermissionException("COPY FROM is disabled by configuration");
 	}
 	BoundStatement result;
@@ -97,22 +97,23 @@ BoundStatement Binder::BindCopyFrom(CopyStatement &stmt) {
 	vector<string> expected_names;
 	if (!bound_insert.column_index_map.empty()) {
 		expected_names.resize(bound_insert.expected_types.size());
-		for (idx_t i = 0; i < table->columns.size(); i++) {
+		for (auto &col : table->columns.Logical()) {
+			auto i = col.Physical();
 			if (bound_insert.column_index_map[i] != DConstants::INVALID_INDEX) {
-				expected_names[bound_insert.column_index_map[i]] = table->columns[i].name;
+				expected_names[bound_insert.column_index_map[i]] = col.Name();
 			}
 		}
 	} else {
 		expected_names.reserve(bound_insert.expected_types.size());
-		for (idx_t i = 0; i < table->columns.size(); i++) {
-			expected_names.push_back(table->columns[i].name);
+		for (auto &col : table->columns.Logical()) {
+			expected_names.push_back(col.Name());
 		}
 	}
 
 	auto function_data =
 	    copy_function->function.copy_from_bind(context, *stmt.info, expected_names, bound_insert.expected_types);
-	auto get = make_unique<LogicalGet>(0, copy_function->function.copy_from_function, move(function_data),
-	                                   bound_insert.expected_types, expected_names);
+	auto get = make_unique<LogicalGet>(GenerateTableIndex(), copy_function->function.copy_from_function,
+	                                   move(function_data), bound_insert.expected_types, expected_names);
 	for (idx_t i = 0; i < bound_insert.expected_types.size(); i++) {
 		get->column_ids.push_back(i);
 	}
@@ -140,7 +141,8 @@ BoundStatement Binder::Bind(CopyStatement &stmt) {
 		}
 		stmt.select_statement = move(statement);
 	}
-	this->allow_stream_result = false;
+	properties.allow_stream_result = false;
+	properties.return_type = StatementReturnType::CHANGED_ROWS;
 	if (stmt.info->is_from) {
 		return BindCopyFrom(stmt);
 	} else {

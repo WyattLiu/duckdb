@@ -4,6 +4,7 @@
 #include "duckdb/planner/expression_iterator.hpp"
 #include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/function/scalar/generic_functions.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
 #include "duckdb/planner/expression/bound_function_expression.hpp"
 
 namespace duckdb {
@@ -40,12 +41,14 @@ unique_ptr<Expression> ExpressionRewriter::ApplyRules(LogicalOperator &op, const
 
 unique_ptr<Expression> ExpressionRewriter::ConstantOrNull(unique_ptr<Expression> child, Value value) {
 	vector<unique_ptr<Expression>> children;
+	children.push_back(make_unique<BoundConstantExpression>(value));
 	children.push_back(move(child));
 	return ConstantOrNull(move(children), move(value));
 }
 
 unique_ptr<Expression> ExpressionRewriter::ConstantOrNull(vector<unique_ptr<Expression>> children, Value value) {
 	auto type = value.type();
+	children.insert(children.begin(), make_unique<BoundConstantExpression>(value));
 	return make_unique<BoundFunctionExpression>(type, ConstantOrNull::GetFunction(type), move(children),
 	                                            ConstantOrNull::Bind(move(value)));
 }
@@ -82,6 +85,10 @@ void ExpressionRewriter::VisitExpression(unique_ptr<Expression> *expression) {
 		changes_made = false;
 		*expression = ExpressionRewriter::ApplyRules(*op, to_apply_rules, move(*expression), changes_made, true);
 	} while (changes_made);
+}
+
+ClientContext &Rule::GetContext() const {
+	return rewriter.context;
 }
 
 } // namespace duckdb

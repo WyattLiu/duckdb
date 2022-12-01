@@ -20,15 +20,27 @@ static_assert(sizeof(timestamp_t) == sizeof(int64_t), "timestamp_t was padded");
 // T may be a space
 // Z is optional
 // ISO 8601
-bool Timestamp::TryConvertTimestamp(const char *str, idx_t len, timestamp_t &result) {
+static inline bool CharacterIsTimeZone(char c) {
+	return StringUtil::CharacterIsAlpha(c) || StringUtil::CharacterIsDigit(c) || c == '_' || c == '/';
+}
+
+bool Timestamp::TryConvertTimestampTZ(const char *str, idx_t len, timestamp_t &result, bool &has_offset, string_t &tz) {
 	idx_t pos;
 	date_t date;
 	dtime_t time;
-	if (!Date::TryConvertDate(str, len, pos, date)) {
+	has_offset = false;
+	if (!Date::TryConvertDate(str, len, pos, date, has_offset)) {
 		return false;
 	}
 	if (pos == len) {
-		// no time: only a date
+		// no time: only a date or special
+		if (date == date_t::infinity()) {
+			result = timestamp_t::infinity();
+			return true;
+		} else if (date == date_t::ninfinity()) {
+			result = timestamp_t::ninfinity();
+			return true;
+		}
 		return Timestamp::TryFromDatetime(date, dtime_t(0), result);
 	}
 	// try to parse a time field
@@ -45,12 +57,27 @@ bool Timestamp::TryConvertTimestamp(const char *str, idx_t len, timestamp_t &res
 	}
 	if (pos < len) {
 		// skip a "Z" at the end (as per the ISO8601 specs)
+		int hour_offset, minute_offset;
 		if (str[pos] == 'Z') {
 			pos++;
-		}
-		int hour_offset, minute_offset;
-		if (Timestamp::TryParseUTCOffset(str, pos, len, hour_offset, minute_offset)) {
+			has_offset = true;
+		} else if (Timestamp::TryParseUTCOffset(str, pos, len, hour_offset, minute_offset)) {
 			result -= hour_offset * Interval::MICROS_PER_HOUR + minute_offset * Interval::MICROS_PER_MINUTE;
+			has_offset = true;
+		} else {
+			// Parse a time zone: / [A-Za-z0-9/_]+/
+			if (str[pos++] != ' ') {
+				return false;
+			}
+			auto tz_name = str + pos;
+			for (; pos < len && CharacterIsTimeZone(str[pos]); ++pos) {
+				continue;
+			}
+			auto tz_len = str + pos - tz_name;
+			if (tz_len) {
+				tz = string_t(tz_name, tz_len);
+			}
+			// Note that the caller must reinterpret the instant we return to the given time zone
 		}
 
 		// skip any spaces at the end
@@ -64,9 +91,16 @@ bool Timestamp::TryConvertTimestamp(const char *str, idx_t len, timestamp_t &res
 	return true;
 }
 
+bool Timestamp::TryConvertTimestamp(const char *str, idx_t len, timestamp_t &result) {
+	string_t tz(nullptr, 0);
+	bool has_offset = false;
+	// We don't understand TZ without an extension, so fail if one was provided.
+	return TryConvertTimestampTZ(str, len, result, has_offset, tz) && !tz.GetSize();
+}
+
 string Timestamp::ConversionError(const string &str) {
 	return StringUtil::Format("timestamp field value out of range: \"%s\", "
-	                          "expected format is (YYYY-MM-DD HH:MM:SS[.MS])",
+	                          "expected format is (YYYY-MM-DD HH:MM:SS[.US][±HH:MM| ZONE])",
 	                          str);
 }
 
@@ -135,6 +169,11 @@ timestamp_t Timestamp::FromString(const string &str) {
 }
 
 string Timestamp::ToString(timestamp_t timestamp) {
+	if (timestamp == timestamp_t::infinity()) {
+		return Date::PINF;
+	} else if (timestamp == timestamp_t::ninfinity()) {
+		return Date::NINF;
+	}
 	date_t date;
 	dtime_t time;
 	Timestamp::Convert(timestamp, date, time);
@@ -142,10 +181,18 @@ string Timestamp::ToString(timestamp_t timestamp) {
 }
 
 date_t Timestamp::GetDate(timestamp_t timestamp) {
+	if (timestamp == timestamp_t::infinity()) {
+		return date_t::infinity();
+	} else if (timestamp == timestamp_t::ninfinity()) {
+		return date_t::ninfinity();
+	}
 	return date_t((timestamp.value + (timestamp.value < 0)) / Interval::MICROS_PER_DAY - (timestamp.value < 0));
 }
 
 dtime_t Timestamp::GetTime(timestamp_t timestamp) {
+	if (!IsFinite(timestamp)) {
+		throw ConversionException("Can't get TIME of infinite TIMESTAMP");
+	}
 	date_t date = Timestamp::GetDate(timestamp);
 	return dtime_t(timestamp.value - (int64_t(date.days) * int64_t(Interval::MICROS_PER_DAY)));
 }
@@ -157,7 +204,7 @@ bool Timestamp::TryFromDatetime(date_t date, dtime_t time, timestamp_t &result) 
 	if (!TryAddOperator::Operation<int64_t, int64_t, int64_t>(result.value, time.micros, result.value)) {
 		return false;
 	}
-	return true;
+	return Timestamp::IsFinite(result);
 }
 
 timestamp_t Timestamp::FromDatetime(date_t date, dtime_t time) {
