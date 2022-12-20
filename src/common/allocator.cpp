@@ -21,8 +21,11 @@
 #include <iostream>
 #include <mutex>
 
+#include "lemon.h"
+#define LEMON_MALLOC 1
 namespace duckdb {
 std::mutex mtx;
+lemon_vmm vmm;
 
 AllocatedData::AllocatedData() : allocator(nullptr), pointer(nullptr), allocated_size(0) {
 }
@@ -129,19 +132,23 @@ data_ptr_t Allocator::AllocateData(idx_t size) {
 		                        size, MAXIMUM_ALLOC_SIZE);
 	}
 
-
+#ifndef LEMON_MALLOC
 	auto result = allocate_function(private_data.get(), size);
+#endif
 #ifdef DEBUG
 	D_ASSERT(private_data);
 	private_data->debug_info->AllocateData(result, size);
 #endif
+#ifndef LEMON_MALLOC
 	if (!result) {
 		throw std::bad_alloc();
 	}
-
+#endif
+#ifdef LEMON_MALLOC
 	mtx.lock();
-	std::cout << "Allocate: " << size << std::endl;
+	auto result = (data_ptr_t)vmm.lemon_malloc(size);
 	mtx.unlock();
+#endif
 
 	return result;
 }
@@ -155,7 +162,14 @@ void Allocator::FreeData(data_ptr_t pointer, idx_t size) {
 	D_ASSERT(private_data);
 	private_data->debug_info->FreeData(pointer, size);
 #endif
+#ifndef LEMON_MALLOC
 	free_function(private_data.get(), pointer, size);
+#endif
+#ifdef LEMON_MALLOC
+	mtx.lock();
+	vmm.lemon_free(pointer);
+	mtx.unlock();
+#endif
 }
 
 data_ptr_t Allocator::ReallocateData(data_ptr_t pointer, idx_t old_size, idx_t size) {
@@ -168,15 +182,31 @@ data_ptr_t Allocator::ReallocateData(data_ptr_t pointer, idx_t old_size, idx_t s
 		    "Requested re-allocation size of %llu is out of range - maximum allocation size is %llu", size,
 		    MAXIMUM_ALLOC_SIZE);
 	}
+#ifndef LEMON_MALLOC
 	auto new_pointer = reallocate_function(private_data.get(), pointer, old_size, size);
+#endif
+
 #ifdef DEBUG
 	D_ASSERT(private_data);
 	private_data->debug_info->ReallocateData(pointer, new_pointer, old_size, size);
 #endif
+#ifndef LEMON_MALLOC
 	if (!new_pointer) {
 		throw std::bad_alloc();
 	}
 	return new_pointer;
+#endif
+
+#ifdef LEMON_MALLOC
+	mtx.lock();
+	cout << "reallocate" << endl;
+	void* new_addr = vmm.lemon_malloc(size);
+	memcpy(new_addr, pointer, old_size);
+	vmm.lemon_free(pointer);
+	mtx.unlock();
+	return (data_ptr_t)new_addr;
+#endif
+
 }
 
 shared_ptr<Allocator> &Allocator::DefaultAllocatorReference() {

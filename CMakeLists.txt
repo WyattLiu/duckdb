@@ -30,6 +30,16 @@ set(CMAKE_VERBOSE_MAKEFILE OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 set(CMAKE_MACOSX_RPATH 1)
 
+set(lemon_LIB_ROOT /home/wyatt/CLionProjects/lemon/)
+include_directories(${lemon_LIB_ROOT})
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/../lemonade/shared)
+
+link_directories(${lemon_LIB_ROOT}cmake-build-release/)
+
+find_library(lemon_LIB_ROOT lemon)
+
+
+
 find_program(CCACHE_PROGRAM ccache)
 if(CCACHE_PROGRAM)
   set_property(GLOBAL PROPERTY RULE_LAUNCH_COMPILE "${CCACHE_PROGRAM}")
